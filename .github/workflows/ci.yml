@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install vcpkg dependencies
         uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgGitCommitId: f3e10653cc27d62a37a3763cd84b38bca07c6075
       - name: Configure
         run: >
           cmake -B build -S .
