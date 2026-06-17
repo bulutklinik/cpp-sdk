@@ -125,7 +125,7 @@ public:
     const std::optional<std::string>& client_secret() const { return client_secret_; }
 
     nlohmann::json send(const std::string& method, const std::string& path, AuthMode auth,
-                        const std::optional<nlohmann::json>& body) {
+                        const nlohmann::json& body = nlohmann::json()) {
         return send_impl(method, path, auth, body, false);
     }
 
@@ -144,7 +144,7 @@ private:
     };
 
     nlohmann::json send_impl(const std::string& method, const std::string& path, AuthMode auth,
-                             const std::optional<nlohmann::json>& body, bool is_retry) {
+                             const nlohmann::json& body, bool is_retry) {
         std::optional<std::string> stale_access;
         if (auth == AuthMode::Bearer) {
             stale_access = token_store_->access_token();
@@ -168,15 +168,15 @@ private:
     }
 
     Dispatch dispatch(const std::string& method, const std::string& path, AuthMode auth,
-                      const std::optional<nlohmann::json>& body) {
+                      const nlohmann::json& body) {
         HttpRequest req;
         req.method = method;
         req.url = base_url_ + path;
         req.timeout_ms = timeout_ms_;
         req.headers["Accept"] = "application/json";
         req.headers["lang"] = lang_;
-        if (body && method != "GET") {
-            req.body = body->dump();
+        if (!body.is_null() && method != "GET") {
+            req.body = body.dump();
             req.headers["Content-Type"] = "application/json";
         }
         if (auth == AuthMode::Bearer) {
@@ -365,11 +365,11 @@ void AuthResource::disconnect() {
 // ---------------- DoctorsResource ----------------
 
 nlohmann::json DoctorsResource::branches() {
-    return t_->send("GET", "/patients/allBranches", detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", "/patients/allBranches", detail::AuthMode::Bearer);
 }
 
 nlohmann::json DoctorsResource::locations() {
-    return t_->send("GET", "/patients/allLocations", detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", "/patients/allLocations", detail::AuthMode::Bearer);
 }
 
 nlohmann::json DoctorsResource::quick_search(const std::string& search_text,
@@ -394,7 +394,7 @@ nlohmann::json DoctorsResource::search(const SearchInput& in) {
 
 nlohmann::json DoctorsResource::detail(const std::string& id, const std::optional<std::string>& corporate) {
     std::string path = "/patients/doctorDetail/" + id + (corporate ? "/" + *corporate : "");
-    return t_->send("GET", path, bulutklinik::detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", path, bulutklinik::detail::AuthMode::Bearer);
 }
 
 // ---------------- SlotsResource ----------------
@@ -430,7 +430,7 @@ nlohmann::json AppointmentsResource::add_physical(const std::string& doctor_id, 
 }
 
 nlohmann::json AppointmentsResource::cancel(const std::string& event_id) {
-    return t_->send("DELETE", "/patients/deleteUserAppointment/" + event_id, detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("DELETE", "/patients/deleteUserAppointment/" + event_id, detail::AuthMode::Bearer);
 }
 
 // ---------------- PaymentsResource ----------------
@@ -459,7 +459,7 @@ nlohmann::json PaymentsResource::check_discount_code(const std::string& check_ty
 }
 
 nlohmann::json PaymentsResource::get_cards() {
-    return t_->send("GET", "/payments/getCards", detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", "/payments/getCards", detail::AuthMode::Bearer);
 }
 
 nlohmann::json PaymentsResource::save_card(const CardInfo& card) {
@@ -488,7 +488,7 @@ nlohmann::json PaymentsResource::pay(const PaymentInput& in) {
 }
 
 nlohmann::json PaymentsResource::delete_card(const std::string& card_id) {
-    return t_->send("DELETE", "/payments/deleteCard/" + card_id, detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("DELETE", "/payments/deleteCard/" + card_id, detail::AuthMode::Bearer);
 }
 
 // ---------------- MeasuresResource ----------------
@@ -513,7 +513,7 @@ nlohmann::json MeasuresResource::delete_measure(const std::string& measure_type,
 }
 
 nlohmann::json MeasuresResource::last() {
-    return t_->send("GET", "/patients/measuresList", detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", "/patients/measuresList", detail::AuthMode::Bearer);
 }
 
 nlohmann::json MeasuresResource::list(const std::string& measure_type, const std::string& page,
@@ -522,7 +522,7 @@ nlohmann::json MeasuresResource::list(const std::string& measure_type, const std
     if (glucose_type) {
         path += "/" + std::to_string(*glucose_type);
     }
-    return t_->send("GET", path, detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", path, detail::AuthMode::Bearer);
 }
 
 nlohmann::json MeasuresResource::graph(const std::string& measure_type, int period, const std::string& page,
@@ -531,7 +531,7 @@ nlohmann::json MeasuresResource::graph(const std::string& measure_type, int peri
     if (glucose_type) {
         path += "/" + std::to_string(*glucose_type);
     }
-    return t_->send("GET", path, detail::AuthMode::Bearer, std::nullopt);
+    return t_->send("GET", path, detail::AuthMode::Bearer);
 }
 
 nlohmann::json MeasuresResource::partner_health_information(const std::optional<std::string>& identity,

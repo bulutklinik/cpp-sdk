@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <string>
 
 #include <cpr/cpr.h>
@@ -19,7 +20,7 @@ HttpResponse CprHttpBackend::send(const HttpRequest& request) {
     cpr::Session session;
     session.SetUrl(cpr::Url{request.url});
     session.SetHeader(headers);
-    session.SetTimeout(cpr::Timeout{request.timeout_ms});
+    session.SetTimeout(cpr::Timeout{std::chrono::milliseconds(request.timeout_ms)});
     if (request.body) {
         session.SetBody(cpr::Body{*request.body});
     }
