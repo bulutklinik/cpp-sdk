@@ -1,5 +1,5 @@
 from conan import ConanFile
-from conan.tools.cmake import CMake, CMakeToolchain, cmake_layout
+from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 
 class BulutklinikSdkConan(ConanFile):
@@ -29,6 +29,8 @@ class BulutklinikSdkConan(ConanFile):
         cmake_layout(self)
 
     def generate(self):
+        deps = CMakeDeps(self)
+        deps.generate()
         tc = CMakeToolchain(self)
         tc.cache_variables["BULUTKLINIK_BUILD_TESTS"] = "OFF"
         tc.generate()
