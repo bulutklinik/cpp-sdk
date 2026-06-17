@@ -1,0 +1,6 @@
+build/
+cmake-build-*/
+vcpkg_installed/
+*.o
+*.a
+*.so

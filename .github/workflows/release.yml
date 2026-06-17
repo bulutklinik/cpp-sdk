@@ -1,0 +1,41 @@
+name: Release
+
+# On a vX.Y.Z tag: build + test via vcpkg, cut a GitHub release, and validate the
+# Conan recipe with `conan create`. Publishing to a Conan remote is org-specific
+# (configure the remote + secrets and uncomment the upload steps). Submitting the
+# vcpkg port to the upstream registry is a manual PR — see PUBLISHING.md.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: lukka/run-vcpkg@v11
+      - run: >
+          cmake -B build -S .
+          -DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_BUILD_TYPE=Release
+      - run: cmake --build build --config Release
+      - run: ctest --test-dir build --output-on-failure
+      - uses: softprops/action-gh-release@v2
+
+  conan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install "conan>=2.0"
+      - run: conan profile detect --force
+      - run: conan create . --build=missing
+      # To publish to your own Conan remote, configure secrets and uncomment:
+      # - run: conan remote add bulutklinik "${{ secrets.CONAN_REMOTE_URL }}"
+      # - run: conan remote login bulutklinik "${{ secrets.CONAN_LOGIN_USERNAME }}" -p "${{ secrets.CONAN_LOGIN_PASSWORD }}"
+      # - run: conan upload "bulutklinik-sdk/*" -r bulutklinik --confirm
