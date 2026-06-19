@@ -55,6 +55,38 @@ TEST_CASE("unwraps data and sends headers") {
     REQUIRE(backend->requests.at(0).headers.at("lang") == "tr");
 }
 
+TEST_CASE("request escape hatch issues a bearer GET to the right URL") {
+    auto backend = std::make_shared<MockBackend>();
+    backend->responder = [](const HttpRequest&) {
+        return json_resp(200, R"({"resultType":0,"data":{"ok":true}})");
+    };
+    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("abc"), std::nullopt)));
+
+    auto data = client.request("GET", "/patients/customEndpoint");
+
+    REQUIRE(data["ok"].get<bool>());
+    REQUIRE(backend->requests.at(0).url == "http://localhost/patients/customEndpoint");
+    REQUIRE(backend->requests.at(0).method == "GET");
+    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer abc");
+}
+
+TEST_CASE("request escape hatch sends a public POST body and omits Authorization") {
+    auto backend = std::make_shared<MockBackend>();
+    backend->responder = [](const HttpRequest&) { return json_resp(200, R"({"resultType":0,"data":{"id":7}})"); };
+    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("abc"), std::nullopt)));
+
+    RequestOptions options;
+    options.auth = Auth::Public;
+    options.body = {{"foo", "bar"}};
+    auto data = client.request("POST", "/general/somePublicEndpoint", options);
+
+    REQUIRE(data["id"].get<int>() == 7);
+    REQUIRE(backend->requests.at(0).method == "POST");
+    REQUIRE(backend->requests.at(0).headers.find("Authorization") == backend->requests.at(0).headers.end());
+    auto body = nlohmann::json::parse(backend->requests.at(0).body.value());
+    REQUIRE(body["foo"] == "bar");
+}
+
 TEST_CASE("maps 422 to ValidationError") {
     auto backend = std::make_shared<MockBackend>();
     backend->responder = [](const HttpRequest&) {

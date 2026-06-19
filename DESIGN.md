@@ -10,7 +10,7 @@
 > ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
 > source (Laravel 8.12, OAuth2/Passport).
 
-- **Spec version:** 0.1.0 (validated against the TypeScript reference SDK, live against the `test` environment)
+- **Spec version:** 0.2.0 (adds the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
 - **API:** BulutklinikAPI v3
 - **Scope:** 6 services / 27 endpoints (patient persona). Designed to grow.
 
@@ -399,6 +399,47 @@ responses are typed where practical, otherwise a typed envelope + parsed `data`.
 | `tokenStore`  | in-memory      | Pluggable persistence.                             |
 | `timeout`     | sane default   | Request timeout.                                   |
 | `httpClient`  | platform default | Injectable transport (PSR-18, http.Client, HttpClient, etc.). |
+
+### 7.2 Escape hatch — arbitrary requests
+
+Not every endpoint has a typed resource method, and the API grows faster than the
+SDK surface. Every SDK therefore exposes **one generic request method on the root
+client** for calling any Bulutklinik API endpoint directly. It is not a separate
+HTTP client: it reuses the same transport, so default headers, the chosen auth
+mode, silent token refresh + retry (§5.4), envelope unwrapping (§3) and the typed
+error hierarchy (§4) all still apply.
+
+Concept:
+
+```
+client.request(method, path, { auth, body, lang }) -> data
+```
+
+| Param    | Notes |
+|----------|-------|
+| `method` | `GET` \| `POST` \| `PUT` \| `DELETE`. |
+| `path`   | Relative to the configured base URL, e.g. `/patients/allBranches`. Leading slash included. |
+| `auth`   | `public` \| `bearer` (**default**) \| `partner`. Accepted as a string or an existing public enum/const per language. |
+| `body`   | Optional JSON payload (object/map/dict). Omitted on `GET`. |
+| `lang`   | Optional per-request `lang` override, where the SDK's transport supports one (JS, PHP, Go, C++). Python / Java / C# apply the client-level `lang`. |
+
+Returns the unwrapped `data` payload as the language's raw JSON value (the same
+type a future typed resource method would parse from), and raises the same typed
+errors on failure. Representative per-language signatures (idiomatic, return the
+raw `data`):
+
+| Language | Signature |
+|----------|-----------|
+| JS/TS    | `client.request<T>({ method, path, auth?, body?, lang? }): Promise<T>` |
+| Python   | `client.request(method, path, *, auth="bearer", body=None)` — plus the async client |
+| PHP      | `$client->request(string $method, string $path, string $auth = 'bearer', ?array $body = null, ?string $lang = null): mixed` |
+| Go       | `client.Do(ctx, method, path, *bk.RequestOptions) (json.RawMessage, error)` (nil options ⇒ bearer) |
+| Java     | `client.request(String method, String path, String auth, Object body)` → `JsonNode` |
+| C#       | `client.RequestAsync(HttpMethod method, string path, string auth = "bearer", object? body = null, CancellationToken = default)` → `JsonElement` |
+| C++      | `client.request(method, path, bulutklinik::RequestOptions{})` → `nlohmann::json` |
+
+This is the supported extension point for endpoints outside the 27 in §6. Prefer a
+typed resource method when one exists; reach for `request` only for the gaps.
 
 ---
 

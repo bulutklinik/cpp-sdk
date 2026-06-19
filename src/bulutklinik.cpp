@@ -125,8 +125,9 @@ public:
     const std::optional<std::string>& client_secret() const { return client_secret_; }
 
     nlohmann::json send(const std::string& method, const std::string& path, AuthMode auth,
-                        const nlohmann::json& body = nlohmann::json()) {
-        return send_impl(method, path, auth, body, false);
+                        const nlohmann::json& body = nlohmann::json(),
+                        const std::optional<std::string>& lang = std::nullopt) {
+        return send_impl(method, path, auth, body, lang, false);
     }
 
     void refresh() {
@@ -144,13 +145,14 @@ private:
     };
 
     nlohmann::json send_impl(const std::string& method, const std::string& path, AuthMode auth,
-                             const nlohmann::json& body, bool is_retry) {
+                             const nlohmann::json& body, const std::optional<std::string>& lang,
+                             bool is_retry) {
         std::optional<std::string> stale_access;
         if (auth == AuthMode::Bearer) {
             stale_access = token_store_->access_token();
         }
 
-        Dispatch d = dispatch(method, path, auth, body);
+        Dispatch d = dispatch(method, path, auth, body, lang);
         std::optional<int> result_type = result_type_of(d.envelope);
 
         if (d.status >= 200 && d.status < 300 && result_type && *result_type == 0) {
@@ -159,7 +161,7 @@ private:
 
         const bool expired = d.status == 401 || (result_type && *result_type == 4);
         if (auth == AuthMode::Bearer && expired && !is_retry && try_refresh(stale_access)) {
-            return send_impl(method, path, auth, body, true);
+            return send_impl(method, path, auth, body, lang, true);
         }
         if (result_type && *result_type == 2) {
             token_store_->clear();
@@ -168,13 +170,13 @@ private:
     }
 
     Dispatch dispatch(const std::string& method, const std::string& path, AuthMode auth,
-                      const nlohmann::json& body) {
+                      const nlohmann::json& body, const std::optional<std::string>& lang = std::nullopt) {
         HttpRequest req;
         req.method = method;
         req.url = base_url_ + path;
         req.timeout_ms = timeout_ms_;
         req.headers["Accept"] = "application/json";
-        req.headers["lang"] = lang_;
+        req.headers["lang"] = lang ? *lang : lang_;
         if (!body.is_null() && method != "GET") {
             req.body = body.dump();
             req.headers["Content-Type"] = "application/json";
@@ -307,6 +309,24 @@ SlotsResource Client::slots() { return SlotsResource(transport_.get()); }
 AppointmentsResource Client::appointments() { return AppointmentsResource(transport_.get()); }
 PaymentsResource Client::payments() { return PaymentsResource(transport_.get()); }
 MeasuresResource Client::measures() { return MeasuresResource(transport_.get()); }
+
+nlohmann::json Client::request(const std::string& method, const std::string& path,
+                               const RequestOptions& options) {
+    detail::AuthMode auth = detail::AuthMode::Bearer;
+    switch (options.auth) {
+        case Auth::Public:
+            auth = detail::AuthMode::Public;
+            break;
+        case Auth::Bearer:
+            auth = detail::AuthMode::Bearer;
+            break;
+        case Auth::Partner:
+            auth = detail::AuthMode::Partner;
+            break;
+    }
+    return transport_->send(method, path, auth, options.body, options.lang);
+}
+
 TokenStore& Client::token_store() { return transport_->token_store(); }
 
 // ---------------- AuthResource ----------------

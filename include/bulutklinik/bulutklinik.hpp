@@ -17,6 +17,10 @@ namespace bulutklinik {
 /// Base URL presets.
 enum class Environment { Production, Test, Local };
 
+/// Authorization mode for a request. `Bearer` uses the stored access token,
+/// `Partner` the configured partner token, `Public` sends no `Authorization`.
+enum class Auth { Public, Bearer, Partner };
+
 // ---------------- errors ----------------
 
 /// Base class for every exception thrown by the SDK.
@@ -215,6 +219,15 @@ struct ClientOptions {
     long timeout_ms = 30000;
 };
 
+/// Options for the generic `Client::request` escape hatch. `body` is a plain
+/// `nlohmann::json` (a null value means "no body"); a per-request `lang`
+/// overrides the client default when set.
+struct RequestOptions {
+    Auth auth = Auth::Bearer;
+    nlohmann::json body = nlohmann::json(nullptr);
+    std::optional<std::string> lang;
+};
+
 namespace detail {
 class Transport;
 }
@@ -340,6 +353,22 @@ public:
     AppointmentsResource appointments();
     PaymentsResource payments();
     MeasuresResource measures();
+
+    /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
+    /// typed resource method. The request still goes through the shared transport,
+    /// so default headers, the chosen `auth` mode (`Auth::Bearer` by default),
+    /// silent token refresh + retry, envelope unwrapping and the typed error
+    /// hierarchy all apply. Returns the unwrapped `data` payload. Prefer a typed
+    /// resource method when one exists; reach for this only for the gaps.
+    ///
+    /// @example
+    /// ```cpp
+    /// auto branches = client.request("GET", "/patients/allBranches");
+    /// auto created = client.request("POST", "/patients/someNewEndpoint",
+    ///                               {bulutklinik::Auth::Bearer, {{"foo", "bar"}}});
+    /// ```
+    nlohmann::json request(const std::string& method, const std::string& path,
+                           const RequestOptions& options = {});
 
     TokenStore& token_store();
 
