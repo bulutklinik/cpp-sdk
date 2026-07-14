@@ -10,15 +10,16 @@
 > ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
 > source (Laravel 8.12, OAuth2/Passport).
 
-- **Spec version:** 0.2.0 (adds the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
+- **Spec version:** 0.3.0 (adds the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
 - **API:** BulutklinikAPI v3
-- **Scope:** 6 services / 27 endpoints (patient persona). Designed to grow.
+- **Scope:** 8 services / 29 endpoints (patient persona). Designed to grow.
 
 ---
 
 ## 1. Scope
 
-The SDKs cover the patient appointment-and-payment flow plus health measurements:
+The SDKs cover the patient appointment-and-payment flow, health measurements, and
+AI image analysis:
 
 | Service        | Endpoints | Purpose                                              |
 |----------------|:---------:|------------------------------------------------------|
@@ -28,6 +29,8 @@ The SDKs cover the patient appointment-and-payment flow plus health measurements
 | `appointments` | 3         | Online reservation, physical appointment, cancel     |
 | `payments`     | 5         | Discount check, saved cards, pay (3DS)               |
 | `measures`     | 8         | Health measurements (CRUD, list, graph, partner)     |
+| `skin`         | 1         | AI skin-lesion analysis ("Cildimde Neyim Var")       |
+| `meals`        | 1         | AI meal-photo calorie/nutrition estimation           |
 
 Out of scope for this collection (may be added later): "Anlık randevu" (programs),
 video-call (calls). The SDK surface is designed so new services slot in as new
@@ -361,6 +364,56 @@ Value rules: numeric; `tension`/`pulse` digits 1–10; `glucose` 0–99999.99 + 
 > practice matching falls back to `phoneNumber`. The SDK sends the correct
 > contract (`identity` + `phoneNumber`) and notes this in the README.
 
+### 6.7 `skin`  `[bearer] [scope:patients]`
+
+"Cildimde Neyim Var" — AI skin-lesion analysis. Submit one or more skin photos; each is
+classified (lesion `label`), given a patient-friendly Turkish AI `comment`, image-quality
+flags, a `confidence`, possible ICD hints and an opaque `case_detail` blob.
+
+| Canonical | Method | Path                   | Body |
+|-----------|--------|------------------------|------|
+| `analyze` | POST   | `/patients/imageCheck` | `images[]` — each item `{ image (base64, req), branch_id? }` |
+
+Request: `{ "images": [ { "image": "<base64>", "branch_id"?: <int> } ] }`. `image` is a
+base64-encoded JPEG/PNG/WebP/HEIC (a `data:…;base64,` prefix is accepted). `branch_id`
+optionally tags the stored media with a clinic branch. Mirrors `measures.addList` — a
+loose array of records.
+
+Response `data`: `{ status: [ { id, isClear, isBright, label, comment, confidence, image, error, possible_icd, case_detail } ] }` — one entry per submitted image, `id` = 1-based index:
+- `label` — lesion class from the classifier (may be empty).
+- `comment` — patient-friendly Turkish AI summary.
+- `isClear` / `isBright` — image-quality flags.
+- `confidence` — classifier confidence (0–1) or null.
+- `image` — stored media relative path.
+- `possible_icd` — candidate ICD code(s) or null.
+- `case_detail` — opaque base64-encrypted blob identifying the saved case (§8.2); can be forwarded verbatim as a payment's `caseDetail`.
+- `error` — per-image error message or null.
+
+The SDK returns `data` verbatim (a mostly-untyped map) and never decrypts `case_detail`.
+On a gateway failure the API still returns `status` entries with empty label/comment, so
+callers should treat all fields as optional.
+
+### 6.8 `meals`  `[bearer] [scope:patients]`
+
+AI meal-photo calorie/nutrition estimation — sibling of `skin` (same controller, different
+domain).
+
+| Canonical | Method | Path                         | Body |
+|-----------|--------|------------------------------|------|
+| `analyze` | POST   | `/patients/imageAnalyzeMeal` | `image` (base64, req), `portionSize` (req), `portionGrams?`, `mealType` (req), `note?` |
+
+The SDK input names map to the API's snake_case body
+`{ image, portion_size, portion_grams?, meal_type, note? }` (like `payments.pay`, a typed
+single input):
+- `portion_size` ∈ `small | medium | large | custom` (required).
+- `portion_grams` — required only when `portion_size` is `custom`.
+- `meal_type` ∈ `breakfast | lunch | dinner | snack` (required).
+- `note` — optional free text (≤1000 chars); the model reads Turkish preparation/portion modifiers.
+
+Response `data`: `{ status: { comment: "<json string>" } }` — `comment` is the model's
+nutrition breakdown (a JSON-object string, per the server prompt); the SDK returns it
+verbatim.
+
 ---
 
 ## 7. Naming conventions & API shape
@@ -372,6 +425,7 @@ group exposes the canonical methods above.
 client.auth.connect(...)            client.payments.pay(...)
 client.doctors.search(...)          client.measures.addList(...)
 client.slots.schedule(...)          client.appointments.reserveInterview(...)
+client.skin.analyze(...)            client.meals.analyze(...)
 ```
 
 Per-language casing & idioms:
@@ -438,7 +492,7 @@ raw `data`):
 | C#       | `client.RequestAsync(HttpMethod method, string path, string auth = "bearer", object? body = null, CancellationToken = default)` → `JsonElement` |
 | C++      | `client.request(method, path, bulutklinik::RequestOptions{})` → `nlohmann::json` |
 
-This is the supported extension point for endpoints outside the 27 in §6. Prefer a
+This is the supported extension point for endpoints outside the 29 in §6. Prefer a
 typed resource method when one exists; reach for `request` only for the gaps.
 
 ---
@@ -460,9 +514,11 @@ If `is3D = false`, `data` is the inline-completed order result (no `payment3DUrl
 
 ### 8.2 Encrypted blobs — passthrough
 
-`connect`'s `data.response` (2FA), `register`'s `response`, and `caseDetail` are
-opaque encrypted blobs. The SDK passes them through verbatim and never encrypts
-or decrypts. The clinic/API encryption keys are never embedded in the SDK.
+`connect`'s `data.response` (2FA), `register`'s `response`, `caseDetail`, and the
+`case_detail` returned by `skin.analyze` are opaque encrypted blobs. The SDK passes
+them through verbatim and never encrypts or decrypts — a `skin.analyze` `case_detail`
+may be forwarded unchanged as a payment's `caseDetail`. The clinic/API encryption keys
+are never embedded in the SDK.
 
 ### 8.3 Public vs bearer vs partner
 

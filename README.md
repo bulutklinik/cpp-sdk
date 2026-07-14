@@ -4,7 +4,8 @@ Official Bulutklinik API SDK for C++ (C++17). Built on
 [cpr](https://github.com/libcpr/cpr) (libcurl) + [nlohmann/json](https://github.com/nlohmann/json).
 
 Covers the patient flow: **auth, doctor search, slots, appointments, payments,
-and health measures**. See [`DESIGN.md`](./DESIGN.md) for the full wire contract.
+health measures, and AI image analysis (skin + meals)**. See
+[`DESIGN.md`](./DESIGN.md) for the full wire contract.
 
 ## Install (CMake + vcpkg)
 
@@ -67,9 +68,32 @@ int main() {
 | `client.appointments()`   | `reserve_interview`, `add_physical`, `cancel` |
 | `client.payments()`       | `check_discount_code`, `get_cards`, `save_card`, `pay`, `delete_card` |
 | `client.measures()`       | `add_list`, `add`, `update`, `delete_measure`, `last`, `list`, `graph`, `partner_health_information` |
+| `client.skin()`           | `analyze` |
+| `client.meals()`          | `analyze` |
 
 Data methods return `nlohmann::json`. (`register_patient` / `delete_measure` are
 named to avoid the C++ keywords `register` / `delete`.)
+
+## AI image analysis
+
+Skin-lesion analysis ("Cildimde Neyim Var") and meal-photo calorie/nutrition
+estimation. Both take base64 images and return the `data` payload verbatim; the
+`meals` input maps to the API's snake_case body (`portion_size`, `portion_grams`,
+`meal_type`).
+
+```cpp
+// Skin — a loose array of records (`branch_id` optional)
+auto skin = client.skin().analyze({{{"image", "<base64>"}, {"branch_id", 42}}});
+
+// Meals — a typed input; portion_grams is required when portion_size == "custom"
+bulutklinik::MealInput meal;
+meal.image = "<base64>";
+meal.portion_size = "custom";   // small | medium | large | custom
+meal.portion_grams = 300;
+meal.meal_type = "lunch";       // breakfast | lunch | dinner | snack
+meal.note = "az yağlı";         // optional
+auto meals = client.meals().analyze(meal);
+```
 
 ## Authentication & tokens
 

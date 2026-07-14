@@ -309,6 +309,8 @@ SlotsResource Client::slots() { return SlotsResource(transport_.get()); }
 AppointmentsResource Client::appointments() { return AppointmentsResource(transport_.get()); }
 PaymentsResource Client::payments() { return PaymentsResource(transport_.get()); }
 MeasuresResource Client::measures() { return MeasuresResource(transport_.get()); }
+SkinResource Client::skin() { return SkinResource(transport_.get()); }
+MealsResource Client::meals() { return MealsResource(transport_.get()); }
 
 nlohmann::json Client::request(const std::string& method, const std::string& path,
                                const RequestOptions& options) {
@@ -562,6 +564,30 @@ nlohmann::json MeasuresResource::partner_health_information(const std::optional<
     body["phoneNumber"] = phone_number ? nlohmann::json(*phone_number) : nlohmann::json(nullptr);
     body["data"] = data;
     return t_->send("POST", "/outher/healthInformation", detail::AuthMode::Partner, body);
+}
+
+// ---------------- SkinResource ----------------
+
+nlohmann::json SkinResource::analyze(const std::vector<nlohmann::json>& images) {
+    nlohmann::json body;
+    body["images"] = images;
+    return t_->send("POST", "/patients/imageCheck", detail::AuthMode::Bearer, body);
+}
+
+// ---------------- MealsResource ----------------
+
+nlohmann::json MealsResource::analyze(const MealInput& in) {
+    nlohmann::json body;
+    body["image"] = in.image;
+    body["portion_size"] = in.portion_size;
+    body["meal_type"] = in.meal_type;
+    if (in.portion_grams) {
+        body["portion_grams"] = *in.portion_grams;
+    }
+    if (in.note) {
+        body["note"] = *in.note;
+    }
+    return t_->send("POST", "/patients/imageAnalyzeMeal", detail::AuthMode::Bearer, body);
 }
 
 }  // namespace bulutklinik

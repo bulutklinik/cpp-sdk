@@ -207,6 +207,18 @@ struct PaymentInput {
     std::optional<std::string> case_detail;
 };
 
+/// Input for `meals().analyze`. `image` is base64 (a `data:…;base64,` prefix is
+/// accepted). `portion_size` is one of `small | medium | large | custom` and
+/// `meal_type` one of `breakfast | lunch | dinner | snack`. `portion_grams` is
+/// required when `portion_size == "custom"`. `note` is optional free text.
+struct MealInput {
+    std::string image;
+    std::string portion_size;
+    std::string meal_type;
+    std::optional<int> portion_grams;
+    std::optional<std::string> note;
+};
+
 struct ClientOptions {
     Environment environment = Environment::Production;
     std::optional<std::string> base_url;
@@ -335,6 +347,34 @@ private:
     detail::Transport* t_;
 };
 
+/// "Cildimde Neyim Var" — AI skin-lesion analysis.
+class SkinResource {
+public:
+    explicit SkinResource(detail::Transport* transport) : t_(transport) {}
+
+    /// Analyze one or more skin photos. Each image is a loose record like
+    /// `{"image": "<base64>", "branch_id": 42}` (`branch_id` optional). Returns
+    /// the `data` payload verbatim (per-image lesion label, Turkish comment,
+    /// confidence, possible ICD hints and an opaque `case_detail` blob).
+    nlohmann::json analyze(const std::vector<nlohmann::json>& images);
+
+private:
+    detail::Transport* t_;
+};
+
+/// AI meal-photo calorie/nutrition estimation (sibling of `skin`).
+class MealsResource {
+public:
+    explicit MealsResource(detail::Transport* transport) : t_(transport) {}
+
+    /// Estimate calories and nutrition from a meal photo. Input names map to the
+    /// API's snake_case body (`portion_size`, `portion_grams`, `meal_type`).
+    nlohmann::json analyze(const MealInput& input);
+
+private:
+    detail::Transport* t_;
+};
+
 // ---------------- client ----------------
 
 /// The Bulutklinik API client. Construct once and reuse; resources are obtained
@@ -353,6 +393,8 @@ public:
     AppointmentsResource appointments();
     PaymentsResource payments();
     MeasuresResource measures();
+    SkinResource skin();
+    MealsResource meals();
 
     /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
     /// typed resource method. The request still goes through the shared transport,

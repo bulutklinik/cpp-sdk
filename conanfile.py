@@ -4,7 +4,7 @@ from conan.tools.cmake import CMake, CMakeDeps, CMakeToolchain, cmake_layout
 
 class BulutklinikSdkConan(ConanFile):
     name = "bulutklinik-sdk"
-    version = "0.2.0"
+    version = "0.3.0"
     license = "MIT"
     url = "https://github.com/bulutklinik/cpp-sdk"
     homepage = "https://github.com/bulutklinik/cpp-sdk"

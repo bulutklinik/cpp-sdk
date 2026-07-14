@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(bulutklinik_sdk VERSION 0.2.0 LANGUAGES CXX)
+project(bulutklinik_sdk VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,7 +21,7 @@ option(BULUTKLINIK_BUILD_TESTS "Build the test suite" ON)
 if(BULUTKLINIK_BUILD_TESTS)
     enable_testing()
     find_package(Catch2 3 CONFIG REQUIRED)
-    add_executable(bulutklinik_tests tests/test_transport.cpp)
+    add_executable(bulutklinik_tests tests/test_transport.cpp tests/test_ai.cpp)
     target_link_libraries(bulutklinik_tests PRIVATE
         bulutklinik_sdk Catch2::Catch2WithMain nlohmann_json::nlohmann_json)
     add_test(NAME bulutklinik_tests COMMAND bulutklinik_tests)
