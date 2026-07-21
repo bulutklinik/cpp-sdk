@@ -360,6 +360,28 @@ void AuthResource::connect_with_two_factor(const std::string& sms_verification_c
     store_tokens(t_, data);
 }
 
+nlohmann::json AuthResource::verify_registration(const VerifyRegistrationInput& in) {
+    nlohmann::json body;
+    body["name"] = in.name;
+    body["surname"] = in.surname;
+    body["phoneNumber"] = in.phone_number;
+    body["phone_code"] = in.phone_code;
+    body["email"] = in.email;
+    body["password"] = in.password;
+    body["passwordAgain"] = in.password;
+    body["acceptUserAgreement"] = in.accept_user_agreement == 0 ? 1 : in.accept_user_agreement;
+    if (in.recaptcha_v2) {
+        body["g-recaptcha-response-v2"] = *in.recaptcha_v2;
+    }
+    if (in.captcha) {
+        body["captcha"] = *in.captcha;
+    }
+    if (in.user_agreements) {
+        body["userAgreements"] = *in.user_agreements;
+    }
+    return t_->send("POST", "/patients/verifyAddingNewPatient", detail::AuthMode::Partner, body);
+}
+
 void AuthResource::register_patient(const RegisterInput& in) {
     nlohmann::json body;
     body["name"] = in.name;

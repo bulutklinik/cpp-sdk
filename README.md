@@ -62,7 +62,7 @@ int main() {
 
 | Accessor                  | Methods |
 |---------------------------|---------|
-| `client.auth()`           | `connect`, `connect_with_two_factor`, `register_patient`, `refresh`, `disconnect` |
+| `client.auth()`           | `connect`, `connect_with_two_factor`, `verify_registration`, `register_patient`, `refresh`, `disconnect` |
 | `client.doctors()`        | `branches`, `locations`, `quick_search`, `search`, `detail` |
 | `client.slots()`          | `schedule` |
 | `client.appointments()`   | `reserve_interview`, `add_physical`, `cancel` |

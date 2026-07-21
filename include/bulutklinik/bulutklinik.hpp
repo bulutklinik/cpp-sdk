@@ -186,6 +186,26 @@ struct RegisterInput {
     std::optional<std::string> client_secret;
 };
 
+/// Input for the registration verify step (AuthResource::verify_registration).
+/// The endpoint requires a CAPTCHA token (recaptcha_v2 or captcha) minted by a
+/// browser/human, and is authorized with the configured partner token.
+struct VerifyRegistrationInput {
+    std::string name;
+    std::string surname;
+    std::string phone_number;
+    /// Country dial code only, e.g. "+90" (matches ^\+\d{1,3}$).
+    std::string phone_code;
+    std::string email;
+    std::string password;
+    int accept_user_agreement = 1;
+    /// Sent as "g-recaptcha-response-v2". Provide this or captcha.
+    std::optional<std::string> recaptcha_v2;
+    /// Sent as "captcha". Provide this or recaptcha_v2.
+    std::optional<std::string> captcha;
+    /// Optional structured agreement approvals, passed through verbatim.
+    std::optional<nlohmann::json> user_agreements;
+};
+
 struct SearchInput {
     nlohmann::json search_params = nlohmann::json::object();
     std::vector<std::string> order_params;
@@ -265,6 +285,12 @@ public:
                         const std::optional<std::string>& client_secret = std::nullopt,
                         const std::optional<std::string>& with_phone_number = std::nullopt);
     void connect_with_two_factor(const std::string& sms_verification_code, const std::string& response);
+    /// Registration step 1: send the verification code and return the raw data
+    /// holding the encrypted `response` blob. Uses the configured partner token
+    /// (the endpoint is behind `auth:apiusers`, not public); a CAPTCHA token
+    /// (recaptcha_v2 or captcha), minted by a browser/human, is required. Feed the
+    /// returned `response` (and the code the user receives) into register_patient.
+    nlohmann::json verify_registration(const VerifyRegistrationInput& input);
     /// Named register_patient because `register` is a reserved keyword in C++.
     void register_patient(const RegisterInput& input);
     void refresh();

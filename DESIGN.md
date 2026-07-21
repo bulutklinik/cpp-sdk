@@ -10,9 +10,9 @@
 > ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
 > source (Laravel 8.12, OAuth2/Passport).
 
-- **Spec version:** 0.4.0 (adds the `laboratory` + `diets` patient groups; 0.3.0 added the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
+- **Spec version:** 0.5.0 (adds `auth.verifyRegistration`, the registration SMS/e-mail pre-step that mints the `response` blob `register` consumes; 0.4.0 added the `laboratory` + `diets` patient groups; 0.3.0 added the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
 - **API:** BulutklinikAPI v3
-- **Scope:** 10 services / 36 endpoints (patient persona). Designed to grow.
+- **Scope:** 10 services / 37 endpoints (patient persona). Designed to grow.
 
 ---
 
@@ -23,7 +23,7 @@ AI image analysis:
 
 | Service        | Endpoints | Purpose                                              |
 |----------------|:---------:|------------------------------------------------------|
-| `auth`         | 5         | Login, 2FA, token refresh, registration, logout      |
+| `auth`         | 6         | Login, 2FA, token refresh, registration (verify + create), logout |
 | `doctors`      | 5         | Branches, locations, quick/filtered search, detail   |
 | `slots`        | 1         | Doctor availability (materialized slots)             |
 | `appointments` | 3         | Online reservation, physical appointment, cancel     |
@@ -220,13 +220,46 @@ secure storage). Required operations (named per language):
 - set tokens (access, refresh) — atomically
 - clear (on logout / revoked session)
 
-### 5.6 Registration — `auth.register`
+### 5.6 Registration (2-step) — `auth.verifyRegistration` → `auth.register`
+
+Registration is a **two-call** flow. The first call sends the verification code and
+returns the encrypted `response` blob; the second call consumes that blob (plus the
+code the user received) to create the patient and auto-login.
+
+#### 5.6.1 Verify — `auth.verifyRegistration`
+
+`POST /patients/verifyAddingNewPatient`. **Not public** — guarded by
+`auth:apiusers`, so it uses the SDK's **partner** token (the same apiusers bearer as
+`partnerHealthInformation`, no specific scope required here), plus a
+`throttle:perHourFifty` limit. This is the reason the step needs a configured
+`partnerToken`; a patient bearer will **not** satisfy the guard.
+
+Request body: `name`, `surname`, `phoneNumber`, `phone_code`, `email`, `password`,
+`passwordAgain`, `acceptUserAgreement`, one of `g-recaptcha-response-v2` / `captcha`,
+optional `userAgreements[]`.
+
+Rules (validated in `VerifyAddingNewPatientRequest`):
+- `phoneNumber` must match `^[+]([0-9\s\(\)]*)$` and be **unique** in `mbl_users`
+  (this is where duplicate-account detection happens).
+- `phone_code` must match `^\+\d{1,3}$` (e.g. `+90`).
+- `email` is required (modern app versions) and unique in `mbl_users`.
+- `passwordAgain` must equal `password`; the SDKs auto-fill it from `password`.
+- **CAPTCHA is mandatory** (`g-recaptcha-response-v2` *or* `captcha`, required-without
+  each other), validated last via a live Cloudflare/Google call. A pure server-side
+  caller cannot mint this token — it must come from a browser/human. The SDK method is
+  therefore a **thin passthrough**: the caller supplies the captcha token.
+
+Success → `data: { response: "<hashedCode>", confirmationType: "sms" | "email" }`.
+The SDK returns `data` verbatim; feed `response` (and the code the user receives) into
+`register`. The `response` blob is opaque and passed through unchanged (§8.2).
+
+#### 5.6.2 Create — `auth.register`
 
 `POST /patients/addNewPatient`. **Public** but guarded by SMS verification
 (`checkPhoneVerificationSmsCode`) + throttle.
 
 Request body: `name`, `surname`, `apiUserName`, `phoneNumber`, `password`,
-`smsVerificationCode`, `response` (encrypted blob from the prior SMS-verify step),
+`smsVerificationCode`, `response` (the blob from `verifyRegistration`),
 `acceptUserAgreement` (1), `apiClientId`, `apiSecretKey`.
 
 Rules (validated):
@@ -238,10 +271,6 @@ Rules (validated):
 
 Success → patient created + automatic `afterRegister` login → `data: { access_token, refresh_token }`.
 
-> The prior SMS-verification step (`verifyAddingNewPatient`) that produces the
-> `response` blob is **not in this collection**. SDKs expose `register` as-is and
-> document that `response` + `smsVerificationCode` must be obtained beforehand.
-
 ### 5.7 Logout — `auth.disconnect`
 
 `POST /general/disconnectApi`. **Bearer required** (`auth:patients,apiusers,doctors`).
@@ -250,7 +279,7 @@ token store. Optional device-token fields (firebase/ios) may be added to the bod
 
 ---
 
-## 6. Endpoint reference (36)
+## 6. Endpoint reference (37)
 
 Notation: **Canonical name** = language-neutral concept → per-language naming
 follows §7. `[public]` = no auth; `[bearer]` = access token; `[partner]` = partner
@@ -263,6 +292,7 @@ token; `[scope:…]` = required OAuth scope.
 | `connect`            | POST   | `/general/connectApi`              | public   |
 | `connectWithTwoFactor`| POST  | `/general/connectApiWithTwoFactor` | public   |
 | `refresh`            | POST   | `/general/refreshApi`              | public   |
+| `verifyRegistration` | POST   | `/patients/verifyAddingNewPatient` | partner  |
 | `register`           | POST   | `/patients/addNewPatient`          | public*  |
 | `disconnect`         | POST   | `/general/disconnectApi`           | bearer   |
 
@@ -562,8 +592,9 @@ are never embedded in the SDK.
 
 - Public (no `Authorization`): `connect`, `connectWithTwoFactor`, `refresh`, `register`.
 - Bearer (access token): everything else.
-- Partner: `partnerHealthInformation` uses a separately-configured partner token
-  (`scope:teusan`), not the patient access token.
+- Partner: `partnerHealthInformation` (`scope:teusan`) and `verifyRegistration`
+  (`auth:apiusers`, no specific scope) use the separately-configured partner token,
+  not the patient access token.
 
 ---
 

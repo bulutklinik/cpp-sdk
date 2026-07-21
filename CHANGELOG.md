@@ -4,6 +4,17 @@ All notable changes to the Bulutklinik C++ SDK are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0]
+
+### Added
+
+- `client.auth().verify_registration(input)` — step 1 of registration
+  (`POST /patients/verifyAddingNewPatient`): sends the verification code and returns
+  the raw `nlohmann::json` holding the encrypted `response` blob to pass to
+  `register_patient`. Uses the configured partner token (`auth:apiusers`, not
+  public) and requires a browser-minted CAPTCHA token (`recaptcha_v2` or `captcha`).
+- Type: `VerifyRegistrationInput`.
+
 ## [0.4.0]
 
 ### Added
