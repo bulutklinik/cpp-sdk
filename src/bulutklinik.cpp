@@ -311,6 +311,8 @@ PaymentsResource Client::payments() { return PaymentsResource(transport_.get());
 MeasuresResource Client::measures() { return MeasuresResource(transport_.get()); }
 SkinResource Client::skin() { return SkinResource(transport_.get()); }
 MealsResource Client::meals() { return MealsResource(transport_.get()); }
+LaboratoryResource Client::laboratory() { return LaboratoryResource(transport_.get()); }
+DietsResource Client::diets() { return DietsResource(transport_.get()); }
 
 nlohmann::json Client::request(const std::string& method, const std::string& path,
                                const RequestOptions& options) {
@@ -588,6 +590,45 @@ nlohmann::json MealsResource::analyze(const MealInput& in) {
         body["note"] = *in.note;
     }
     return t_->send("POST", "/patients/imageAnalyzeMeal", detail::AuthMode::Bearer, body);
+}
+
+// ---------------- LaboratoryResource ----------------
+
+nlohmann::json LaboratoryResource::results(std::optional<std::string> page) {
+    std::string path = "/patients/userLabTestList" + (page ? "/" + *page : "");
+    return t_->send("GET", path, detail::AuthMode::Bearer);
+}
+
+nlohmann::json LaboratoryResource::result_detail(const std::string& test_id) {
+    return t_->send("GET", "/patients/userLabTestDetail/" + test_id, detail::AuthMode::Bearer);
+}
+
+nlohmann::json LaboratoryResource::catalog() {
+    return t_->send("GET", "/patients/allLaboratoryTests", detail::AuthMode::Bearer);
+}
+
+nlohmann::json LaboratoryResource::catalog_detail(const std::string& id) {
+    return t_->send("GET", "/patients/laboratoryTestDetail/" + id, detail::AuthMode::Bearer);
+}
+
+nlohmann::json LaboratoryResource::order(const LabOrderInput& in) {
+    nlohmann::json body = {
+        {"testId", in.test_id},
+        {"addressId", in.address_id},
+        {"laboratoryId", in.laboratory_id},
+    };
+    return t_->send("POST", "/patients/addNewLaboratoryTest", detail::AuthMode::Bearer, body);
+}
+
+// ---------------- DietsResource ----------------
+
+nlohmann::json DietsResource::list(std::optional<std::string> page) {
+    std::string path = "/patients/dietLists" + (page ? "/" + *page : "");
+    return t_->send("GET", path, detail::AuthMode::Bearer);
+}
+
+nlohmann::json DietsResource::detail(const std::string& list_id) {
+    return t_->send("GET", "/patients/diet/" + list_id, detail::AuthMode::Bearer);
 }
 
 }  // namespace bulutklinik

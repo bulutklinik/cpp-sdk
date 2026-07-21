@@ -219,6 +219,14 @@ struct MealInput {
     std::optional<std::string> note;
 };
 
+/// Input for `laboratory().order`. All three ids are required and map to the
+/// API body `{ testId, addressId, laboratoryId }`.
+struct LabOrderInput {
+    std::string test_id;
+    std::string address_id;
+    std::string laboratory_id;
+};
+
 struct ClientOptions {
     Environment environment = Environment::Production;
     std::optional<std::string> base_url;
@@ -375,6 +383,42 @@ private:
     detail::Transport* t_;
 };
 
+/// The patient's laboratory results, the orderable test catalog, and pre-ordering.
+class LaboratoryResource {
+public:
+    explicit LaboratoryResource(detail::Transport* transport) : t_(transport) {}
+
+    /// The patient's completed/in-progress lab results. `page` defaults to 1
+    /// server-side when the segment is omitted.
+    nlohmann::json results(std::optional<std::string> page = std::nullopt);
+    /// One result's detail. `test_id` is a string (`"123"` or `"123-lab"`),
+    /// interpolated verbatim.
+    nlohmann::json result_detail(const std::string& test_id);
+    /// The orderable test-group catalog.
+    nlohmann::json catalog();
+    /// One catalog group by id.
+    nlohmann::json catalog_detail(const std::string& id);
+    /// Pre-order a lab test. All three ids are required.
+    nlohmann::json order(const LabOrderInput& input);
+
+private:
+    detail::Transport* t_;
+};
+
+/// The patient's diet lists (a dietitian's "Diyet Listesi"). JSON only.
+class DietsResource {
+public:
+    explicit DietsResource(detail::Transport* transport) : t_(transport) {}
+
+    /// The patient's diet lists. `page` defaults to 1 server-side when omitted.
+    nlohmann::json list(std::optional<std::string> page = std::nullopt);
+    /// One diet list's detail by `list_id`.
+    nlohmann::json detail(const std::string& list_id);
+
+private:
+    detail::Transport* t_;
+};
+
 // ---------------- client ----------------
 
 /// The Bulutklinik API client. Construct once and reuse; resources are obtained
@@ -395,6 +439,8 @@ public:
     MeasuresResource measures();
     SkinResource skin();
     MealsResource meals();
+    LaboratoryResource laboratory();
+    DietsResource diets();
 
     /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
     /// typed resource method. The request still goes through the shared transport,

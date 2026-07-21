@@ -4,6 +4,23 @@ All notable changes to the Bulutklinik C++ SDK are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0]
+
+### Added
+
+- `client.laboratory()` — the patient's lab results, the orderable test catalog,
+  and test pre-ordering (DESIGN.md §6.9): `results(page?)`
+  (`GET /patients/userLabTestList/{page?}`), `result_detail(test_id)`
+  (`GET /patients/userLabTestDetail/{testId}`; `testId` is a string, e.g.
+  `"4821-lab"`), `catalog()` (`GET /patients/allLaboratoryTests`),
+  `catalog_detail(id)` (`GET /patients/laboratoryTestDetail/{id}`), and
+  `order(input)` (`POST /patients/addNewLaboratoryTest`).
+- `client.diets()` — the patient's diet lists (DESIGN.md §6.10): `list(page?)`
+  (`GET /patients/dietLists/{page?}`) and `detail(list_id)`
+  (`GET /patients/diet/{listId}`).
+- `LabOrderInput` struct for the `laboratory().order` input (maps to the body
+  `testId`, `addressId`, `laboratoryId`).
+
 ## [0.3.0]
 
 ### Added

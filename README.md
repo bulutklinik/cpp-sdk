@@ -4,7 +4,7 @@ Official Bulutklinik API SDK for C++ (C++17). Built on
 [cpr](https://github.com/libcpr/cpr) (libcurl) + [nlohmann/json](https://github.com/nlohmann/json).
 
 Covers the patient flow: **auth, doctor search, slots, appointments, payments,
-health measures, and AI image analysis (skin + meals)**. See
+health measures, AI image analysis (skin + meals), lab results, and diet lists**. See
 [`DESIGN.md`](./DESIGN.md) for the full wire contract.
 
 ## Install (CMake + vcpkg)
@@ -70,6 +70,8 @@ int main() {
 | `client.measures()`       | `add_list`, `add`, `update`, `delete_measure`, `last`, `list`, `graph`, `partner_health_information` |
 | `client.skin()`           | `analyze` |
 | `client.meals()`          | `analyze` |
+| `client.laboratory()`     | `results`, `result_detail`, `catalog`, `catalog_detail`, `order` |
+| `client.diets()`          | `list`, `detail` |
 
 Data methods return `nlohmann::json`. (`register_patient` / `delete_measure` are
 named to avoid the C++ keywords `register` / `delete`.)

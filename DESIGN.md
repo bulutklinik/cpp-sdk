@@ -10,9 +10,9 @@
 > ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
 > source (Laravel 8.12, OAuth2/Passport).
 
-- **Spec version:** 0.3.0 (adds the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
+- **Spec version:** 0.4.0 (adds the `laboratory` + `diets` patient groups; 0.3.0 added the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
 - **API:** BulutklinikAPI v3
-- **Scope:** 8 services / 29 endpoints (patient persona). Designed to grow.
+- **Scope:** 10 services / 36 endpoints (patient persona). Designed to grow.
 
 ---
 
@@ -31,6 +31,8 @@ AI image analysis:
 | `measures`     | 8         | Health measurements (CRUD, list, graph, partner)     |
 | `skin`         | 1         | AI skin-lesion analysis ("Cildimde Neyim Var")       |
 | `meals`        | 1         | AI meal-photo calorie/nutrition estimation           |
+| `laboratory`   | 5         | Lab results, orderable test catalog, test pre-order  |
+| `diets`        | 2         | Diet lists (list + detail) written by the dietitian  |
 
 Out of scope for this collection (may be added later): "Anlık randevu" (programs),
 video-call (calls). The SDK surface is designed so new services slot in as new
@@ -248,7 +250,7 @@ token store. Optional device-token fields (firebase/ios) may be added to the bod
 
 ---
 
-## 6. Endpoint reference (27)
+## 6. Endpoint reference (36)
 
 Notation: **Canonical name** = language-neutral concept → per-language naming
 follows §7. `[public]` = no auth; `[bearer]` = access token; `[partner]` = partner
@@ -414,6 +416,41 @@ Response `data`: `{ status: { comment: "<json string>" } }` — `comment` is the
 nutrition breakdown (a JSON-object string, per the server prompt); the SDK returns it
 verbatim.
 
+### 6.9 `laboratory`  `[bearer] [scope:patients]`
+
+The patient's own laboratory results, the orderable test catalog, and test pre-ordering.
+The controller (`v3\General\Laboratory`) is `@hideFromAPIDocumentation`, so this group is
+hand-written from the API source, not the auto-docs.
+
+| Canonical       | Method | Path                                          | Body / params |
+|-----------------|--------|-----------------------------------------------|---------------|
+| `results`       | GET    | `/patients/userLabTestList/{page?}`           | optional `page` (default 1). The patient's completed/in-progress lab results. |
+| `resultDetail`  | GET    | `/patients/userLabTestDetail/{testId}`        | path `testId` (**string**) — pass the id from a `results` item verbatim. |
+| `catalog`       | GET    | `/patients/allLaboratoryTests`                | — (orderable test-group catalog). |
+| `catalogDetail` | GET    | `/patients/laboratoryTestDetail/{id}`         | path `id` (numeric) — one catalog group. |
+| `order`         | POST   | `/patients/addNewLaboratoryTest`              | `testId` (numeric, req), `addressId` (numeric, req), `laboratoryId` (numeric, req). |
+
+- `results` `data`: `{ foundTestsCount, foundTests: [ { id, created_at, company_name, test_name, test_state, test_state_text, test_type, test_type_text } ] }`. `test_state` 0=Numune Alınıyor, 1=Çalışıyor, 2=Onaylandı; `test_type` 1=Normal, 2=Grup, 3=Alt Parametre. The list also unions in TMC-lab-ordered tests whose `id` carries a `-lab` suffix (e.g. `"4821-lab"`).
+- `resultDetail`: `{testId}` may be a plain id (`"123"`, DB path) or `"<id>-lab"` (TMC-lab path). `data` fields: `test_name, protocol_no, id, created_at, company_name, result, result_unit, test_state, test_state_text, test_type, test_type_text, result_type_text, sub_tests`. For `test_type == 1` the payload adds `normal_lower_limit, normal_upper_limit, panic_lower_limit, panic_upper_limit` (age/gender-aware). For `test_type == 2`, `sub_tests[]` carries per-parameter results plus those four limit fields.
+- `catalog` returns `test_groups[]`: each `{ id, name, image, background, desc (HTML), tests[]{id,name}, laboratories[]{ company_id, name, doctor_id, branch_id, prices{ real_price, discount_rate, discounted_price, discount_code, discount_title, discount_id }, cities[]{id,name} } }`. Served from `config/laboratory.php`, not the DB.
+- `catalogDetail` returns the single matching group; for `pat` users the per-laboratory `prices` are recomputed through the discount provider.
+- `order` success → `data: { preOrderId }`. Validated against the catalog (`test_not_found`, `laboratory_not_found`), the user address (`user_address_not_found`, `invalid_user_address_for_lab` — the address city must be served by the lab), and duplicate open orders. Business failures return HTTP 501.
+- **Not exposed:** the deprecated `POST /patients/addNewLabTest` (superseded by `order`), and the `results` endpoint's optional `companyId` query filter (SDKs use path params only, and that server-side filter is known-buggy).
+
+### 6.10 `diets`  `[bearer] [scope:patients]`
+
+The patient's diet lists (a dietitian's "Diyet Listesi"). Controller `v3\General\Diets`,
+`@hideFromAPIDocumentation`. JSON only — the server's PDF export (`dietFile`) is out of SDK scope
+(it returns a binary `application/pdf`, not the envelope).
+
+| Canonical | Method | Path                              | Body / params |
+|-----------|--------|-----------------------------------|---------------|
+| `list`    | GET    | `/patients/dietLists/{page?}`     | optional `page` (default 1). Page size is fixed to 10 server-side. |
+| `detail`  | GET    | `/patients/diet/{listId}`         | path `listId` (numeric) = a `list_id` from a `list` item. |
+
+- `list` `data`: `{ foundDietsCount, foundDiets: [ { list_id, diet_date, protocol_no, patient_name, patient_surname, patient_birthdate, patient_identity_no, doctor_company_name, doctor_name, doctor_surname, doctor_title, doctor_branch_name, doctor_image } ] }`. One entry per diet-program group; `list_id` feeds `detail`.
+- `detail` `data`: an **array of meal-time groups** `[ { time, meals: [ { meal_time, total_calories, protocol_no, patient_*, doctor_company_name, diet_date, doctor_name, doctor_surname, doctor_title, doctor_image, doctor_certified_number, doctor_branch_name, meal_details: [ { quantity, explanation, meal_name, kcal, unit } ] } ] } ]`. An empty diet returns HTTP 501.
+
 ---
 
 ## 7. Naming conventions & API shape
@@ -426,6 +463,7 @@ client.auth.connect(...)            client.payments.pay(...)
 client.doctors.search(...)          client.measures.addList(...)
 client.slots.schedule(...)          client.appointments.reserveInterview(...)
 client.skin.analyze(...)            client.meals.analyze(...)
+client.laboratory.results(...)      client.diets.list(...)
 ```
 
 Per-language casing & idioms:
