@@ -313,6 +313,7 @@ SkinResource Client::skin() { return SkinResource(transport_.get()); }
 MealsResource Client::meals() { return MealsResource(transport_.get()); }
 LaboratoryResource Client::laboratory() { return LaboratoryResource(transport_.get()); }
 DietsResource Client::diets() { return DietsResource(transport_.get()); }
+AddressesResource Client::addresses() { return AddressesResource(transport_.get()); }
 
 nlohmann::json Client::request(const std::string& method, const std::string& path,
                                const RequestOptions& options) {
@@ -398,6 +399,69 @@ void AuthResource::register_patient(const RegisterInput& in) {
     store_tokens(t_, data);
 }
 
+nlohmann::json AuthResource::confirm_registration_email(const ConfirmRegistrationEmailInput& in) {
+    nlohmann::json body;
+    body["verificationCode"] = in.verification_code;
+    body["response"] = in.response;
+    if (in.user_agreements) {
+        body["userAgreements"] = *in.user_agreements;
+    }
+    return t_->send("POST", "/patients/emailConfirmationRegister", detail::AuthMode::Public, body);
+}
+
+nlohmann::json AuthResource::verify_registration_social(const VerifyRegistrationSocialInput& in) {
+    nlohmann::json body;
+    body["name"] = in.name;
+    body["surname"] = in.surname;
+    body["phoneNumber"] = in.phone_number;
+    body["password"] = in.password;
+    body["passwordAgain"] = in.password;
+    body["socialType"] = in.social_type;
+    body["key"] = in.key;
+    body["acceptUserAgreement"] = in.accept_user_agreement == 0 ? 1 : in.accept_user_agreement;
+    if (in.email) {
+        body["email"] = *in.email;
+    }
+    if (in.user_agreements) {
+        body["userAgreements"] = *in.user_agreements;
+    }
+    return t_->send("POST", "/patients/verifyAddingNewPatientSocial", detail::AuthMode::Public, body);
+}
+
+void AuthResource::register_social(const RegisterSocialInput& in) {
+    nlohmann::json body;
+    body["smsVerificationCode"] = in.sms_verification_code;
+    body["response"] = in.response;
+    if (in.user_agreements) {
+        body["userAgreements"] = *in.user_agreements;
+    }
+    t_->send("POST", "/patients/addNewPatientWithSocial", detail::AuthMode::Public, body);
+}
+
+nlohmann::json AuthResource::forgot_password(const ForgotPasswordInput& in) {
+    nlohmann::json body;
+    body["phoneNumber"] = in.phone_number;
+    if (in.birthdate) {
+        body["birthdate"] = *in.birthdate;
+    }
+    if (in.recaptcha_v2) {
+        body["g-recaptcha-response-v2"] = *in.recaptcha_v2;
+    }
+    if (in.captcha) {
+        body["captcha"] = *in.captcha;
+    }
+    return t_->send("POST", "/patients/forgotPassword", detail::AuthMode::Public, body);
+}
+
+void AuthResource::reset_password(const ResetPasswordInput& in) {
+    nlohmann::json body;
+    body["smsConfirmCode"] = in.sms_confirm_code;
+    body["response"] = in.response;
+    body["password"] = in.password;
+    body["passwordAgain"] = in.password;
+    t_->send("PUT", "/patients/forgotPassword", detail::AuthMode::Public, body);
+}
+
 void AuthResource::refresh() { t_->refresh(); }
 
 void AuthResource::disconnect() {
@@ -477,6 +541,73 @@ nlohmann::json AppointmentsResource::add_physical(const std::string& doctor_id, 
 
 nlohmann::json AppointmentsResource::cancel(const std::string& event_id) {
     return t_->send("DELETE", "/patients/deleteUserAppointment/" + event_id, detail::AuthMode::Bearer);
+}
+
+nlohmann::json AppointmentsResource::list(std::optional<std::string> page) {
+    std::string path = page ? "/patients/userAppointments/" + *page : "/patients/userAppointments";
+    return t_->send("GET", path, detail::AuthMode::Bearer);
+}
+
+nlohmann::json AppointmentsResource::reservations() {
+    return t_->send("GET", "/patients/userReservations", detail::AuthMode::Bearer);
+}
+
+// ---------------- AddressesResource ----------------
+
+nlohmann::json AddressesResource::list() {
+    return t_->send("GET", "/patients/userAddress", detail::AuthMode::Bearer);
+}
+
+nlohmann::json AddressesResource::add(const AddressInput& in) {
+    nlohmann::json body;
+    body["title"] = in.title;
+    body["cityId"] = in.city_id;
+    body["districtId"] = in.district_id;
+    body["address"] = in.address;
+    body["locationLat"] = in.location_lat;
+    body["locationLng"] = in.location_lng;
+    if (in.description) {
+        body["description"] = *in.description;
+    }
+    if (in.is_default) {
+        body["isDefault"] = *in.is_default;
+    }
+    return t_->send("POST", "/patients/userAddress", detail::AuthMode::Bearer, body);
+}
+
+nlohmann::json AddressesResource::update(const AddressUpdateInput& in) {
+    nlohmann::json body;
+    body["id"] = in.id;
+    if (in.title) {
+        body["title"] = *in.title;
+    }
+    if (in.description) {
+        body["description"] = *in.description;
+    }
+    if (in.city_id) {
+        body["cityId"] = *in.city_id;
+    }
+    if (in.district_id) {
+        body["districtId"] = *in.district_id;
+    }
+    if (in.address) {
+        body["address"] = *in.address;
+    }
+    if (in.location_lat) {
+        body["locationLat"] = *in.location_lat;
+    }
+    if (in.location_lng) {
+        body["locationLng"] = *in.location_lng;
+    }
+    if (in.is_default) {
+        body["isDefault"] = *in.is_default;
+    }
+    return t_->send("PUT", "/patients/userAddress", detail::AuthMode::Bearer, body);
+}
+
+nlohmann::json AddressesResource::delete_address(const std::string& id) {
+    nlohmann::json body = {{"id", id}};
+    return t_->send("DELETE", "/patients/userAddress", detail::AuthMode::Bearer, body);
 }
 
 // ---------------- PaymentsResource ----------------

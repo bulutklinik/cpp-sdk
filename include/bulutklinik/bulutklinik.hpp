@@ -206,6 +206,83 @@ struct VerifyRegistrationInput {
     std::optional<nlohmann::json> user_agreements;
 };
 
+/// Step 2 of the e-mail-branch registration (AuthResource::confirm_registration_email).
+struct ConfirmRegistrationEmailInput {
+    std::string verification_code;
+    /// The blob from verify_registration (when confirmationType was "email").
+    std::string response;
+    std::optional<nlohmann::json> user_agreements;
+};
+
+/// Step 1 of social sign-up (public; no CAPTCHA and no partner token).
+struct VerifyRegistrationSocialInput {
+    std::string name;
+    std::string surname;
+    std::string phone_number;
+    std::string password;
+    /// Social provider identifier (e.g. "google", "apple").
+    std::string social_type;
+    /// The social provider key/token identifying the user.
+    std::string key;
+    std::optional<std::string> email;
+    int accept_user_agreement = 1;
+    std::optional<nlohmann::json> user_agreements;
+};
+
+/// Step 2 of social sign-up. Does NOT mint tokens; log in via connect (social) after.
+struct RegisterSocialInput {
+    std::string sms_verification_code;
+    /// The blob from verify_registration_social.
+    std::string response;
+    std::optional<nlohmann::json> user_agreements;
+};
+
+/// Step 1 of password reset (AuthResource::forgot_password).
+struct ForgotPasswordInput {
+    std::string phone_number;
+    /// Optional "YYYY-MM-DD"; required by installs that verify identity.
+    std::optional<std::string> birthdate;
+    /// Sent as "g-recaptcha-response-v2". Set this or captcha (required outside local env).
+    std::optional<std::string> recaptcha_v2;
+    std::optional<std::string> captcha;
+};
+
+/// Step 2 of password reset (AuthResource::reset_password).
+struct ResetPasswordInput {
+    std::string sms_confirm_code;
+    /// The blob from forgot_password.
+    std::string response;
+    std::string password;
+};
+
+/// A new patient address (AddressesResource::add). city_id/district_id are numeric
+/// ids sent as strings; city_id comes from doctors().locations(), district_id from
+/// GET /getConfig (cities[].districts[]).
+struct AddressInput {
+    std::string title;
+    std::optional<std::string> description;
+    std::string city_id;
+    std::string district_id;
+    std::string address;
+    std::string location_lat;
+    std::string location_lng;
+    /// 1 makes it the default (the first address is default anyway).
+    std::optional<int> is_default;
+};
+
+/// An address update by id (AddressesResource::update). Unset optionals are omitted.
+struct AddressUpdateInput {
+    std::string id;
+    std::optional<std::string> title;
+    std::optional<std::string> description;
+    std::optional<std::string> city_id;
+    std::optional<std::string> district_id;
+    std::optional<std::string> address;
+    std::optional<std::string> location_lat;
+    std::optional<std::string> location_lng;
+    std::optional<int> is_default;
+};
+
 struct SearchInput {
     nlohmann::json search_params = nlohmann::json::object();
     std::vector<std::string> order_params;
@@ -293,6 +370,20 @@ public:
     nlohmann::json verify_registration(const VerifyRegistrationInput& input);
     /// Named register_patient because `register` is a reserved keyword in C++.
     void register_patient(const RegisterInput& input);
+    /// Step 2 of e-mail-branch registration: confirm the e-mailed code and get the
+    /// SMS blob (confirmationType "sms") to feed into register_patient. Public.
+    nlohmann::json confirm_registration_email(const ConfirmRegistrationEmailInput& input);
+    /// Step 1 of social sign-up: send the SMS code, return the raw data holding the
+    /// response blob. Public (no CAPTCHA/partner token). Feeds register_social.
+    nlohmann::json verify_registration_social(const VerifyRegistrationSocialInput& input);
+    /// Step 2 of social sign-up: create the social patient. Does NOT log in — call
+    /// connect with login_mode "social" afterwards. Public.
+    void register_social(const RegisterSocialInput& input);
+    /// Step 1 of password reset: send the SMS confirm code, return the raw data
+    /// holding the response blob. A CAPTCHA token is required outside local env. Public.
+    nlohmann::json forgot_password(const ForgotPasswordInput& input);
+    /// Step 2 of password reset: set the new password with the SMS confirm code + blob. Public.
+    void reset_password(const ResetPasswordInput& input);
     void refresh();
     void disconnect();
 
@@ -336,6 +427,33 @@ public:
                                     const std::string& appointment_type = "interview");
     nlohmann::json add_physical(const std::string& doctor_id, const std::string& appointment_date);
     nlohmann::json cancel(const std::string& event_id);
+    /// The patient's appointments ({foundAppointmentsCount, foundAppointments}). Each
+    /// item's event_id feeds cancel; rows with event_id "0" are paid-order/refund
+    /// entries (not cancellable). Server paging is disabled — omit page for the full list.
+    nlohmann::json list(std::optional<std::string> page = std::nullopt);
+    /// The patient's active online-slot reservation holds (with a minute_diff countdown).
+    nlohmann::json reservations();
+
+private:
+    detail::Transport* t_;
+};
+
+/// The patient's saved addresses. Required by laboratory().order() (needs an
+/// addressId). add/update take a city_id (from doctors().locations()) and a
+/// district_id (from GET /getConfig — cities[].districts[]).
+class AddressesResource {
+public:
+    explicit AddressesResource(detail::Transport* transport) : t_(transport) {}
+
+    /// List saved addresses (default first). Each item's "id" is the addressId.
+    nlohmann::json list();
+    /// Add an address. Success data is {"addressId": ...}. The first address is default.
+    nlohmann::json add(const AddressInput& input);
+    /// Update an address by id. Send only id + is_default to flip the default flag.
+    nlohmann::json update(const AddressUpdateInput& input);
+    /// Delete an address by id (sent in the body). Named delete_address because
+    /// `delete` is a reserved keyword in C++. Default/used addresses cannot be deleted.
+    nlohmann::json delete_address(const std::string& id);
 
 private:
     detail::Transport* t_;
@@ -467,6 +585,7 @@ public:
     MealsResource meals();
     LaboratoryResource laboratory();
     DietsResource diets();
+    AddressesResource addresses();
 
     /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
     /// typed resource method. The request still goes through the shared transport,

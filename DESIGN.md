@@ -10,9 +10,9 @@
 > ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
 > source (Laravel 8.12, OAuth2/Passport).
 
-- **Spec version:** 0.5.0 (adds `auth.verifyRegistration`, the registration SMS/e-mail pre-step that mints the `response` blob `register` consumes; 0.4.0 added the `laboratory` + `diets` patient groups; 0.3.0 added the `skin` + `meals` AI image-analysis groups; 0.2.0 added the §7.2 escape hatch; validated against the TypeScript reference SDK, live against the `test` environment)
+- **Spec version:** 0.6.0 (completes the registration flows and closes flow-gaps found in the API audit: adds `auth.confirmRegistrationEmail` (the e-mail-branch middle step that `register` actually needs), the social sign-up pair `auth.verifyRegistrationSocial`/`auth.registerSocial`, the password-reset pair `auth.forgotPassword`/`auth.resetPassword`, `appointments.list`/`appointments.reservations` (the source of the `event_id` that `cancel` needs), and the new `addresses` group required by `laboratory.order`; 0.5.0 added `auth.verifyRegistration`; 0.4.0 added `laboratory` + `diets`; 0.3.0 added `skin` + `meals`; 0.2.0 added the §7.2 escape hatch)
 - **API:** BulutklinikAPI v3
-- **Scope:** 10 services / 37 endpoints (patient persona). Designed to grow.
+- **Scope:** 11 services / 48 endpoints (patient persona). Designed to grow.
 
 ---
 
@@ -23,16 +23,17 @@ AI image analysis:
 
 | Service        | Endpoints | Purpose                                              |
 |----------------|:---------:|------------------------------------------------------|
-| `auth`         | 6         | Login, 2FA, token refresh, registration (verify + create), logout |
+| `auth`         | 11        | Login, 2FA, refresh, registration (verify/e-mail-confirm/create), social sign-up, password reset, logout |
 | `doctors`      | 5         | Branches, locations, quick/filtered search, detail   |
 | `slots`        | 1         | Doctor availability (materialized slots)             |
-| `appointments` | 3         | Online reservation, physical appointment, cancel     |
+| `appointments` | 5         | Reserve, physical appointment, cancel, list, reservations |
 | `payments`     | 5         | Discount check, saved cards, pay (3DS)               |
 | `measures`     | 8         | Health measurements (CRUD, list, graph, partner)     |
 | `skin`         | 1         | AI skin-lesion analysis ("Cildimde Neyim Var")       |
 | `meals`        | 1         | AI meal-photo calorie/nutrition estimation           |
 | `laboratory`   | 5         | Lab results, orderable test catalog, test pre-order  |
 | `diets`        | 2         | Diet lists (list + detail) written by the dietitian  |
+| `addresses`    | 4         | The patient's saved addresses (needed by `laboratory.order`) |
 
 Out of scope for this collection (may be added later): "Anlık randevu" (programs),
 video-call (calls). The SDK surface is designed so new services slot in as new
@@ -220,11 +221,21 @@ secure storage). Required operations (named per language):
 - set tokens (access, refresh) — atomically
 - clear (on logout / revoked session)
 
-### 5.6 Registration (2-step) — `auth.verifyRegistration` → `auth.register`
+### 5.6 Registration — `verifyRegistration` → (`confirmRegistrationEmail`) → `register`
 
-Registration is a **two-call** flow. The first call sends the verification code and
-returns the encrypted `response` blob; the second call consumes that blob (plus the
-code the user received) to create the patient and auto-login.
+Registration is a multi-call flow. `verifyRegistration` returns `confirmationType`:
+
+- **`"sms"`** → feed its `response` + the SMS code straight into `register`.
+- **`"email"`** → the user gets the code by **e-mail**; call `confirmRegistrationEmail`
+  first (it verifies the e-mail code, sends an **SMS** code, and returns a *fresh*
+  `response` blob), then feed that blob + the SMS code into `register`.
+
+⚠️ **A headerless SDK caller always gets `"email"`.** The SMS branch of
+`verifyAddingNewPatient` only triggers when an `appversion` header ≤ 5.27 is present;
+SDKs send no such header, so `confirmRegistrationEmail` is a **required** middle step,
+not optional. `register` (guarded by `checkPhoneVerificationSmsCode`, which requires
+`smsVerificationCode`/`smsVerificationExpire` in the blob) cannot consume the e-mail
+blob directly — it returns 501. (Social sign-up uses a separate 2-step pair, §5.6.4.)
 
 #### 5.6.1 Verify — `auth.verifyRegistration`
 
@@ -253,13 +264,27 @@ Success → `data: { response: "<hashedCode>", confirmationType: "sms" | "email"
 The SDK returns `data` verbatim; feed `response` (and the code the user receives) into
 `register`. The `response` blob is opaque and passed through unchanged (§8.2).
 
-#### 5.6.2 Create — `auth.register`
+#### 5.6.2 Confirm e-mail — `auth.confirmRegistrationEmail`
+
+`POST /patients/emailConfirmationRegister`. **Public** (guarded by
+`checkEmailVerificationCode` + throttle). Called only when `verifyRegistration`
+returned `confirmationType: "email"`.
+
+Request body: `verificationCode` (the e-mailed code), `response` (the blob from
+`verifyRegistration`), optional `userAgreements[]`. The rest of the profile is
+carried inside the encrypted blob and merged server-side (`prepareForValidation`),
+so the SDK only sends these fields.
+
+Success → `data: { response: "<new SMS blob>", confirmationType: "sms" }`. Feed that
+`response` + the SMS code into `register`.
+
+#### 5.6.3 Create — `auth.register`
 
 `POST /patients/addNewPatient`. **Public** but guarded by SMS verification
 (`checkPhoneVerificationSmsCode`) + throttle.
 
 Request body: `name`, `surname`, `apiUserName`, `phoneNumber`, `password`,
-`smsVerificationCode`, `response` (the blob from `verifyRegistration`),
+`smsVerificationCode`, `response` (the SMS blob from the previous step),
 `acceptUserAgreement` (1), `apiClientId`, `apiSecretKey`.
 
 Rules (validated):
@@ -271,15 +296,44 @@ Rules (validated):
 
 Success → patient created + automatic `afterRegister` login → `data: { access_token, refresh_token }`.
 
+#### 5.6.4 Social sign-up — `verifyRegistrationSocial` → `registerSocial`
+
+A separate **public** 2-step pair for users who authenticate via a social provider.
+Unlike `verifyRegistration`, both are public — **no CAPTCHA and no partner token**.
+
+- `verifyRegistrationSocial` → `POST /patients/verifyAddingNewPatientSocial`. Body:
+  `name`, `surname`, `phoneNumber`, `password`, `passwordAgain`, `socialType`, `key`,
+  optional `email`, `acceptUserAgreement`, `userAgreements[]`. Sends the SMS code →
+  `data: { response }` (note: **no** `confirmationType`).
+- `registerSocial` → `POST /patients/addNewPatientWithSocial` (guarded by
+  `checkPhoneVerificationSmsCode`). Body: `smsVerificationCode`, `response` (blob from
+  the verify step), optional `userAgreements[]`; the profile is merged from the blob.
+  Creates the social patient and its `sec_social_login` link row. **Does not
+  auto-login** — obtain tokens afterwards with `connect({ loginMode: "social" })`.
+
 ### 5.7 Logout — `auth.disconnect`
 
 `POST /general/disconnectApi`. **Bearer required** (`auth:patients,apiusers,doctors`).
 Revokes the current access + refresh tokens server-side. The SDK then clears the
 token store. Optional device-token fields (firebase/ios) may be added to the body.
 
+### 5.8 Password reset — `forgotPassword` → `resetPassword`
+
+A **public** 2-step self-service reset flow.
+
+- `forgotPassword` → `POST /patients/forgotPassword`. Body: `phoneNumber` (must be a
+  registered number), optional `birthdate` (`YYYY-MM-DD`; some installs verify it),
+  and one of `g-recaptcha-response-v2` / `captcha` — **CAPTCHA is mandatory outside
+  the local environment** (browser-minted, like `verifyRegistration`). Sends the SMS
+  confirm code → `data: { response }`.
+- `resetPassword` → `PUT /patients/forgotPassword` (guarded by
+  `checkForgotPasswordConfirmSmsCode`). Body: `smsConfirmCode`, `response` (blob from
+  `forgotPassword`), `password`, `passwordAgain`. Sets the new password (keyed by the
+  phone/birthdate carried in the blob). Terminal — returns a success message, no tokens.
+
 ---
 
-## 6. Endpoint reference (37)
+## 6. Endpoint reference (48)
 
 Notation: **Canonical name** = language-neutral concept → per-language naming
 follows §7. `[public]` = no auth; `[bearer]` = access token; `[partner]` = partner
@@ -293,7 +347,12 @@ token; `[scope:…]` = required OAuth scope.
 | `connectWithTwoFactor`| POST  | `/general/connectApiWithTwoFactor` | public   |
 | `refresh`            | POST   | `/general/refreshApi`              | public   |
 | `verifyRegistration` | POST   | `/patients/verifyAddingNewPatient` | partner  |
+| `confirmRegistrationEmail` | POST | `/patients/emailConfirmationRegister` | public |
 | `register`           | POST   | `/patients/addNewPatient`          | public*  |
+| `verifyRegistrationSocial` | POST | `/patients/verifyAddingNewPatientSocial` | public |
+| `registerSocial`     | POST   | `/patients/addNewPatientWithSocial` | public*  |
+| `forgotPassword`     | POST   | `/patients/forgotPassword`         | public   |
+| `resetPassword`      | PUT    | `/patients/forgotPassword`         | public   |
 | `disconnect`         | POST   | `/general/disconnectApi`           | bearer   |
 
 (Bodies and responses in §5.)
@@ -330,10 +389,14 @@ Next step's `appointmentDate` = `"Y-m-d H:i"` (date key + `slotStart`, **drop se
 | `reserveInterview` | POST   | `/patients/addInterviewDateReservation`    | `doctorId` (numeric, req), `appointmentDate` (`Y-m-d H:i`, today..+21, req), `appointmentType` (`interview`\|`appointment`, default `interview`) |
 | `addPhysical`      | POST   | `/patients/addNewAppointment`              | `doctorId` (numeric, req), `appointmentDate` (`Y-m-d H:i`, req). No `appointmentType`. |
 | `cancel`           | DELETE | `/patients/deleteUserAppointment/{eventId}`| path `eventId` (= `cln_events.id`) |
+| `list`             | GET    | `/patients/userAppointments/{page?}`       | optional path `page` (paging disabled — page 1 = full list) |
+| `reservations`     | GET    | `/patients/userReservations`               | — |
 
 `reserveInterview` success → `{ resultType: 0, data: null }`; failure → 501.
 `cancel` → 501 for insurance appointments, past cancel-window, or not found.
 Slot is resolved server-side from `doctorId` + `appointmentDate` (no `slotId` in request).
+- `list` → `data: { foundAppointmentsCount, foundAppointments: [ { event_id, event_start_date, doctor_id, doctor_name, doctor_surname, status, amount, online_call, … } ] }`. **`event_id` is the id `cancel` takes**; rows with `event_id == "0"` are paid-order/refund entries (not cancellable) — filter them out.
+- `reservations` → a bare array of active online-slot holds: `{ appoinment_date, doctor_id, doctor_name, doctor_surname, medical_branch_name, minute_diff, second_diff }` (pair `minute_diff`+`second_diff` for a countdown).
 
 ### 6.5 `payments`
 
@@ -481,6 +544,24 @@ The patient's diet lists (a dietitian's "Diyet Listesi"). Controller `v3\General
 - `list` `data`: `{ foundDietsCount, foundDiets: [ { list_id, diet_date, protocol_no, patient_name, patient_surname, patient_birthdate, patient_identity_no, doctor_company_name, doctor_name, doctor_surname, doctor_title, doctor_branch_name, doctor_image } ] }`. One entry per diet-program group; `list_id` feeds `detail`.
 - `detail` `data`: an **array of meal-time groups** `[ { time, meals: [ { meal_time, total_calories, protocol_no, patient_*, doctor_company_name, diet_date, doctor_name, doctor_surname, doctor_title, doctor_image, doctor_certified_number, doctor_branch_name, meal_details: [ { quantity, explanation, meal_name, kcal, unit } ] } ] } ]`. An empty diet returns HTTP 501.
 
+### 6.11 `addresses`  `[bearer] [scope:patients]`
+
+The patient's saved addresses. **Required by `laboratory.order`**, whose `addressId`
+must reference one of these (and whose `city_id` must be in the lab's served cities).
+All four verbs are the same path `/patients/userAddress` (distinguished by method).
+
+| Canonical | Method | Path                     | Body / params |
+|-----------|--------|--------------------------|---------------|
+| `list`    | GET    | `/patients/userAddress`  | — |
+| `add`     | POST   | `/patients/userAddress`  | `title` (req), `cityId` (req, numeric), `districtId` (req, numeric), `address` (req), `locationLat` (req), `locationLng` (req), `description?`, `isDefault?` (0\|1) |
+| `update`  | PUT    | `/patients/userAddress`  | `id` (req); `title`/`cityId`/`districtId`/`address`/`locationLat`/`locationLng` are `required_without:isDefault`; `description?`, `isDefault?` |
+| `delete`  | DELETE | `/patients/userAddress`  | `id` (req, in the **body** — not a path segment) |
+
+- `list` → a bare array (default first): `{ id, title, description, city_id, district_id, address, location_lat, location_lng, is_default, distinct_name }`. **`id` is the `addressId`** used by `update`/`delete`/`laboratory.order`. Returns 501 when the patient has no addresses (treat as "empty"). Only the district name is joined — map `city_id`→name via `doctors.locations`.
+- `add` → `data: { addressId }`. The first address is forced default; setting `isDefault: 1` demotes the previous default.
+- `update`/`delete` → message only (no `data`). The **default address cannot be deleted** (reassign via `update` first), nor can an address already used on an order.
+- `cityId` comes from `doctors.locations` (`location_id`); `districtId` comes from `GET /getConfig` (`cities[].districts[].district_id`), reachable via the §7.2 escape hatch.
+
 ---
 
 ## 7. Naming conventions & API shape
@@ -590,11 +671,15 @@ are never embedded in the SDK.
 
 ### 8.3 Public vs bearer vs partner
 
-- Public (no `Authorization`): `connect`, `connectWithTwoFactor`, `refresh`, `register`.
-- Bearer (access token): everything else.
+- Public (no `Authorization`): `connect`, `connectWithTwoFactor`, `refresh`, `register`,
+  `confirmRegistrationEmail`, `verifyRegistrationSocial`, `registerSocial`,
+  `forgotPassword`, `resetPassword`. (`forgotPassword` still requires a browser CAPTCHA
+  token; the social pair does not.)
+- Bearer (access token): everything else (incl. `appointments.*` and the `addresses` group).
 - Partner: `partnerHealthInformation` (`scope:teusan`) and `verifyRegistration`
   (`auth:apiusers`, no specific scope) use the separately-configured partner token,
-  not the patient access token.
+  not the patient access token. **Only these two** need the partner token — the social
+  registration verify step is public, unlike the non-social `verifyRegistration`.
 
 ---
 
