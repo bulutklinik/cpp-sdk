@@ -309,6 +309,7 @@ SlotsResource Client::slots() { return SlotsResource(transport_.get()); }
 AppointmentsResource Client::appointments() { return AppointmentsResource(transport_.get()); }
 PaymentsResource Client::payments() { return PaymentsResource(transport_.get()); }
 MeasuresResource Client::measures() { return MeasuresResource(transport_.get()); }
+PartnerNamespace Client::partner() { return PartnerNamespace(transport_.get()); }
 SkinResource Client::skin() { return SkinResource(transport_.get()); }
 MealsResource Client::meals() { return MealsResource(transport_.get()); }
 LaboratoryResource Client::laboratory() { return LaboratoryResource(transport_.get()); }
@@ -782,6 +783,256 @@ nlohmann::json DietsResource::list(std::optional<std::string> page) {
 
 nlohmann::json DietsResource::detail(const std::string& list_id) {
     return t_->send("GET", "/patients/diet/" + list_id, detail::AuthMode::Bearer);
+}
+
+// ---------------- partner surface (/outher) ----------------
+
+namespace {
+
+/// Adds an optional string only when it was set, so unset fields never reach the
+/// wire as nulls the server would have to interpret.
+void put_opt(nlohmann::json& target, const char* key, const std::optional<std::string>& value) {
+    if (value) target[key] = *value;
+}
+
+/// Body shared by every patient-scoped read: `{"patient": {...}, ...}`.
+nlohmann::json patient_body(const Patient& patient) {
+    nlohmann::json body;
+    body["patient"] = patient.to_json();
+    return body;
+}
+
+/// Flattens measure fields next to the patient reference, optionally adding an
+/// id. The server expects the columns at the top level, not nested.
+nlohmann::json measure_body(const Patient& patient, const nlohmann::json* fields,
+                            const std::optional<std::string>& id) {
+    nlohmann::json body = patient_body(patient);
+    if (id) body["id"] = *id;
+    if (fields && fields->is_object()) {
+        for (auto it = fields->begin(); it != fields->end(); ++it) body[it.key()] = it.value();
+    }
+    return body;
+}
+
+}  // namespace
+
+nlohmann::json Patient::to_json() const {
+    nlohmann::json out = nlohmann::json::object();
+    put_opt(out, "name", name);
+    put_opt(out, "surname", surname);
+    put_opt(out, "phoneNumber", phone_number);
+    put_opt(out, "identityNumber", identity_number);
+    put_opt(out, "email", email);
+    put_opt(out, "birthdate", birthdate);
+    put_opt(out, "nationality", nationality);
+    if (price) out["price"] = *price;
+    return out;
+}
+
+nlohmann::json AppointmentLookup::to_json() const {
+    nlohmann::json out = nlohmann::json::object();
+    put_opt(out, "hash", hash);
+    put_opt(out, "outherProcessId", outher_process_id);
+    put_opt(out, "doctorId", doctor_id);
+    put_opt(out, "appointmentDate", appointment_date);
+    if (is_outher_doctor) out["isOutherDoctor"] = *is_outher_doctor;
+    return out;
+}
+
+// ---------------- PartnerDoctorsResource ----------------
+
+nlohmann::json PartnerDoctorsResource::search(const nlohmann::json& search_params, int current_page,
+                                              const std::vector<std::string>& order_params) {
+    nlohmann::json body = {
+        {"searchParams", search_params},
+        {"orderParams", order_params},
+        {"currentPage", current_page},
+    };
+    return t_->send("POST", "/outher/search", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerDoctorsResource::branches() {
+    return t_->send("GET", "/outher/branches", detail::AuthMode::Partner);
+}
+
+nlohmann::json PartnerDoctorsResource::detail(const std::string& doctor_id) {
+    return t_->send("GET", "/outher/doctorInfos/" + doctor_id, detail::AuthMode::Partner);
+}
+
+nlohmann::json PartnerDoctorsResource::locations() {
+    return t_->send("GET", "/outher/locations", detail::AuthMode::Partner);
+}
+
+// ---------------- PartnerSlotsResource ----------------
+
+nlohmann::json PartnerSlotsResource::schedule(const std::string& doctor_id,
+                                              const std::optional<std::string>& schedule_date,
+                                              std::optional<int> schedule_step,
+                                              std::optional<int> schedule_page) {
+    nlohmann::json body;
+    body["doctorId"] = doctor_id;
+    put_opt(body, "scheduleDate", schedule_date);
+    if (schedule_step) body["scheduleStep"] = *schedule_step;
+    if (schedule_page) body["schedulePage"] = *schedule_page;
+    return t_->send("POST", "/outher/doctorSlots", detail::AuthMode::Partner, body);
+}
+
+// ---------------- PartnerAppointmentsResource ----------------
+
+nlohmann::json PartnerAppointmentsResource::reserve(const std::string& slot_id,
+                                                    const std::string& doctor_id,
+                                                    const Patient& user) {
+    nlohmann::json body = {{"slotId", slot_id}, {"doctorId", doctor_id}, {"user", user.to_json()}};
+    return t_->send("POST", "/outher/reservation", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::reserve_without_agreement(const std::string& slot_id,
+                                                                      const std::string& doctor_id,
+                                                                      const Patient& user) {
+    nlohmann::json body = {{"slotId", slot_id}, {"doctorId", doctor_id}, {"user", user.to_json()}};
+    return t_->send("POST", "/outher/reservationWithoutAgreement", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::instant_reserve(const Patient& user) {
+    nlohmann::json body = {{"user", user.to_json()}};
+    return t_->send("POST", "/outher/instantReservation", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::create(const std::string& hash,
+                                                   const std::string& outher_process_id) {
+    nlohmann::json body = {{"hash", hash}, {"outherProcessId", outher_process_id}};
+    return t_->send("POST", "/outher/appointment", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::create_without_slot(const std::string& doctor_id,
+                                                                const std::string& start_date,
+                                                                const std::string& finish_date,
+                                                                const Patient& user,
+                                                                std::optional<int> is_outher_doctor) {
+    nlohmann::json body = {
+        {"doctorId", doctor_id},
+        {"startDate", start_date},
+        {"finishDate", finish_date},
+        {"user", user.to_json()},
+    };
+    if (is_outher_doctor) body["isOutherDoctor"] = *is_outher_doctor;
+    return t_->send("POST", "/outher/appointmentWithoutSlot", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::cancel_without_slot(const AppointmentLookup& lookup) {
+    return t_->send("DELETE", "/outher/appointmentWithoutSlot", detail::AuthMode::Partner,
+                    lookup.to_json());
+}
+
+nlohmann::json PartnerAppointmentsResource::list(const std::string& phone_number,
+                                                 const std::optional<std::string>& page,
+                                                 const std::optional<std::string>& type) {
+    nlohmann::json body;
+    body["phoneNumber"] = phone_number;
+    put_opt(body, "page", page);
+    put_opt(body, "type", type);
+    return t_->send("POST", "/outher/appointments", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerAppointmentsResource::info(const AppointmentLookup& lookup) {
+    return t_->send("POST", "/outher/appointmentInfo", detail::AuthMode::Partner, lookup.to_json());
+}
+
+nlohmann::json PartnerAppointmentsResource::check_doctor(const std::string& doctor_id,
+                                                         int is_outher_doctor) {
+    nlohmann::json body = {{"doctorId", doctor_id}, {"isOutherDoctor", is_outher_doctor}};
+    return t_->send("POST", "/outher/checkDoctor", detail::AuthMode::Partner, body);
+}
+
+// ---------------- PartnerDietsResource ----------------
+
+nlohmann::json PartnerDietsResource::list(const Patient& patient,
+                                          const std::optional<std::string>& page) {
+    nlohmann::json body = patient_body(patient);
+    put_opt(body, "currentPage", page);
+    return t_->send("POST", "/outher/dietLists", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerDietsResource::detail(const Patient& patient, const std::string& list_id) {
+    nlohmann::json body = patient_body(patient);
+    body["listId"] = list_id;
+    return t_->send("POST", "/outher/diet", detail::AuthMode::Partner, body);
+}
+
+// ---------------- PartnerLaboratoryResource ----------------
+
+nlohmann::json PartnerLaboratoryResource::catalog() {
+    return t_->send("GET", "/outher/laboratoryCatalog", detail::AuthMode::Partner);
+}
+
+nlohmann::json PartnerLaboratoryResource::catalog_detail(const std::string& test_id) {
+    return t_->send("GET", "/outher/laboratoryCatalog/" + test_id, detail::AuthMode::Partner);
+}
+
+nlohmann::json PartnerLaboratoryResource::results(const Patient& patient,
+                                                  const std::optional<std::string>& page) {
+    nlohmann::json body = patient_body(patient);
+    put_opt(body, "currentPage", page);
+    return t_->send("POST", "/outher/laboratoryResults", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerLaboratoryResource::result_detail(const Patient& patient,
+                                                        const std::string& test_id) {
+    // Kept as a string so a "-lab" suffix (TmcLab order group) survives the round trip.
+    nlohmann::json body = patient_body(patient);
+    body["testId"] = test_id;
+    return t_->send("POST", "/outher/laboratoryResult", detail::AuthMode::Partner, body);
+}
+
+// ---------------- PartnerMeasuresResource ----------------
+
+nlohmann::json PartnerMeasuresResource::last(const Patient& patient) {
+    return t_->send("POST", "/outher/lastMeasures", detail::AuthMode::Partner, patient_body(patient));
+}
+
+nlohmann::json PartnerMeasuresResource::list(const Patient& patient, const std::string& measure_type,
+                                             const std::optional<std::string>& page,
+                                             std::optional<int> glucose_type) {
+    nlohmann::json body = patient_body(patient);
+    put_opt(body, "currentPage", page);
+    if (glucose_type) body["glucoseType"] = *glucose_type;
+    return t_->send("POST", "/outher/measuresList/" + measure_type, detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerMeasuresResource::graph(const Patient& patient, const std::string& measure_type,
+                                              int period, const std::optional<std::string>& page,
+                                              std::optional<int> glucose_type) {
+    nlohmann::json body = patient_body(patient);
+    put_opt(body, "currentPage", page);
+    if (glucose_type) body["glucoseType"] = *glucose_type;
+    std::string path = "/outher/measuresGraph/" + measure_type + "/" + std::to_string(period);
+    return t_->send("POST", path, detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerMeasuresResource::add_list(const Patient& patient,
+                                                 const std::vector<nlohmann::json>& data) {
+    nlohmann::json body = patient_body(patient);
+    body["data"] = data;
+    return t_->send("POST", "/outher/measures", detail::AuthMode::Partner, body);
+}
+
+nlohmann::json PartnerMeasuresResource::add(const Patient& patient, const std::string& measure_type,
+                                            const nlohmann::json& fields) {
+    return t_->send("POST", "/outher/measure/" + measure_type, detail::AuthMode::Partner,
+                    measure_body(patient, &fields, std::nullopt));
+}
+
+nlohmann::json PartnerMeasuresResource::update(const Patient& patient, const std::string& measure_type,
+                                               const std::string& id, const nlohmann::json& fields) {
+    return t_->send("PUT", "/outher/measure/" + measure_type, detail::AuthMode::Partner,
+                    measure_body(patient, &fields, id));
+}
+
+nlohmann::json PartnerMeasuresResource::delete_measure(const Patient& patient,
+                                                       const std::string& measure_type,
+                                                       const std::string& id) {
+    return t_->send("DELETE", "/outher/measure/" + measure_type, detail::AuthMode::Partner,
+                    measure_body(patient, nullptr, id));
 }
 
 }  // namespace bulutklinik

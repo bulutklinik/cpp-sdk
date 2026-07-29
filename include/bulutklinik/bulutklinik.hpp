@@ -567,6 +567,201 @@ private:
 
 /// The Bulutklinik API client. Construct once and reuse; resources are obtained
 /// via accessor methods (e.g. client.doctors().quick_search(...)).
+// ---------------- partner surface (/outher — company-scoped) ----------------
+
+/// Identifies a patient on the partner surface.
+///
+/// Reads need only `identity_number` (primary) or `phone_number` (accepted solely
+/// when it matches exactly one patient in your company — the column is not unique,
+/// and the server fails closed rather than guessing).
+///
+/// Writes need `name`, `surname` and `phone_number` as well: if no matching
+/// patient exists in your company the server creates one.
+struct Patient {
+    std::optional<std::string> name;
+    std::optional<std::string> surname;
+    std::optional<std::string> phone_number;
+    std::optional<std::string> identity_number;
+    std::optional<std::string> email;
+    /// `Y-m-d`.
+    std::optional<std::string> birthdate;
+    /// ISO country code present in `bas_com_countries.code`.
+    std::optional<std::string> nationality;
+    std::optional<double> price;
+
+    /// Serialises only the fields that were set, matching the server contract.
+    nlohmann::json to_json() const;
+};
+
+/// Addresses one appointment either by its process (`hash` + `outher_process_id`)
+/// or by its coordinates (`doctor_id` + `appointment_date` + `is_outher_doctor`).
+/// Supply one pair or the other.
+struct AppointmentLookup {
+    std::optional<std::string> hash;
+    std::optional<std::string> outher_process_id;
+    std::optional<std::string> doctor_id;
+    /// `Y-m-d H:i`.
+    std::optional<std::string> appointment_date;
+    std::optional<int> is_outher_doctor;
+
+    nlohmann::json to_json() const;
+};
+
+/// Doctor discovery on the partner surface. Results are scoped to the doctors
+/// enabled for your integration, so a doctor returned here is one you can book.
+class PartnerDoctorsResource {
+public:
+    explicit PartnerDoctorsResource(detail::Transport* transport) : t_(transport) {}
+
+    nlohmann::json search(const nlohmann::json& search_params, int current_page = 1,
+                          const std::vector<std::string>& order_params = {});
+    nlohmann::json branches();
+    nlohmann::json detail(const std::string& doctor_id);
+    /// City list. Global catalogue — not scoped to your company.
+    nlohmann::json locations();
+
+private:
+    detail::Transport* t_;
+};
+
+/// Doctor availability on the partner surface.
+class PartnerSlotsResource {
+public:
+    explicit PartnerSlotsResource(detail::Transport* transport) : t_(transport) {}
+
+    /// Either pass `schedule_date` (`Y-m-d`), or page with `schedule_step` +
+    /// `schedule_page`; the server requires one of the two forms.
+    nlohmann::json schedule(const std::string& doctor_id,
+                            const std::optional<std::string>& schedule_date = std::nullopt,
+                            std::optional<int> schedule_step = std::nullopt,
+                            std::optional<int> schedule_page = std::nullopt);
+
+private:
+    detail::Transport* t_;
+};
+
+/// Appointment lifecycle on the partner surface. The patient is supplied inline;
+/// the server materialises it inside your company on write.
+///
+/// Payment is not taken through the API: `reserve` returns a process settled
+/// through the hosted web checkout.
+class PartnerAppointmentsResource {
+public:
+    explicit PartnerAppointmentsResource(detail::Transport* transport) : t_(transport) {}
+
+    nlohmann::json reserve(const std::string& slot_id, const std::string& doctor_id,
+                           const Patient& user);
+    nlohmann::json reserve_without_agreement(const std::string& slot_id, const std::string& doctor_id,
+                                             const Patient& user);
+    nlohmann::json instant_reserve(const Patient& user);
+    /// Turn a reservation into a confirmed appointment.
+    nlohmann::json create(const std::string& hash, const std::string& outher_process_id);
+    nlohmann::json create_without_slot(const std::string& doctor_id, const std::string& start_date,
+                                       const std::string& finish_date, const Patient& user,
+                                       std::optional<int> is_outher_doctor = std::nullopt);
+    nlohmann::json cancel_without_slot(const AppointmentLookup& lookup);
+    nlohmann::json list(const std::string& phone_number,
+                        const std::optional<std::string>& page = std::nullopt,
+                        const std::optional<std::string>& type = std::nullopt);
+    nlohmann::json info(const AppointmentLookup& lookup);
+    nlohmann::json check_doctor(const std::string& doctor_id, int is_outher_doctor);
+
+private:
+    detail::Transport* t_;
+};
+
+/// Diet lists recorded for a patient inside your own company. Lists written by
+/// other clinics are not visible here.
+class PartnerDietsResource {
+public:
+    explicit PartnerDietsResource(detail::Transport* transport) : t_(transport) {}
+
+    nlohmann::json list(const Patient& patient,
+                        const std::optional<std::string>& page = std::nullopt);
+    /// `list_id` comes from `list`.
+    nlohmann::json detail(const Patient& patient, const std::string& list_id);
+
+private:
+    detail::Transport* t_;
+};
+
+/// Laboratory catalogue (global, static) and results (your company only, merging
+/// the clinic's HBYS lab requests and TmcLab order groups).
+class PartnerLaboratoryResource {
+public:
+    explicit PartnerLaboratoryResource(detail::Transport* transport) : t_(transport) {}
+
+    nlohmann::json catalog();
+    /// Prices are the plain list prices — the patient-side discount pass does not
+    /// apply on the partner surface.
+    nlohmann::json catalog_detail(const std::string& test_id);
+    /// Each item's `id` is accepted verbatim by `result_detail`; a `-lab` suffix
+    /// marks a TmcLab order group.
+    nlohmann::json results(const Patient& patient,
+                           const std::optional<std::string>& page = std::nullopt);
+    nlohmann::json result_detail(const Patient& patient, const std::string& test_id);
+
+private:
+    detail::Transport* t_;
+};
+
+/// Health measurements on the partner surface.
+///
+/// Scope: written into and read from your own company. Values the patient entered
+/// in the Bulutklinik mobile app live in the consumer tenant and are not visible
+/// here — a consequence of tenant isolation, not a bug.
+class PartnerMeasuresResource {
+public:
+    explicit PartnerMeasuresResource(detail::Transport* transport) : t_(transport) {}
+
+    nlohmann::json last(const Patient& patient);
+    nlohmann::json list(const Patient& patient, const std::string& measure_type,
+                        const std::optional<std::string>& page = std::nullopt,
+                        std::optional<int> glucose_type = std::nullopt);
+    /// `period`: 1=day, 2=week, 3=month, 4=year.
+    nlohmann::json graph(const Patient& patient, const std::string& measure_type, int period,
+                         const std::optional<std::string>& page = std::nullopt,
+                         std::optional<int> glucose_type = std::nullopt);
+    /// Write several measurements of mixed types in one transaction. The server
+    /// caps a single call at 200 rows.
+    nlohmann::json add_list(const Patient& patient, const std::vector<nlohmann::json>& data);
+    nlohmann::json add(const Patient& patient, const std::string& measure_type,
+                       const nlohmann::json& fields);
+    nlohmann::json update(const Patient& patient, const std::string& measure_type,
+                          const std::string& id, const nlohmann::json& fields);
+    /// Named delete_measure because `delete` is a reserved keyword in C++.
+    nlohmann::json delete_measure(const Patient& patient, const std::string& measure_type,
+                                  const std::string& id);
+
+private:
+    detail::Transport* t_;
+};
+
+/// The company-scoped partner surface (`/outher`), reachable as `client.partner()`.
+///
+/// A second persona, not a replacement for the patient one: requests use the
+/// configured `partner_token`, data is limited to your own company, and the
+/// patient is named inline on each call. The silent access-token refresh does not
+/// apply here.
+///
+/// Patient login/registration, the card vault, 3-D Secure payment, self-service AI
+/// and address CRUD have no partner equivalent and stay on the patient surface by
+/// design.
+class PartnerNamespace {
+public:
+    explicit PartnerNamespace(detail::Transport* transport) : t_(transport) {}
+
+    PartnerDoctorsResource doctors() { return PartnerDoctorsResource(t_); }
+    PartnerSlotsResource slots() { return PartnerSlotsResource(t_); }
+    PartnerAppointmentsResource appointments() { return PartnerAppointmentsResource(t_); }
+    PartnerDietsResource diets() { return PartnerDietsResource(t_); }
+    PartnerLaboratoryResource laboratory() { return PartnerLaboratoryResource(t_); }
+    PartnerMeasuresResource measures() { return PartnerMeasuresResource(t_); }
+
+private:
+    detail::Transport* t_;
+};
+
 class Client {
 public:
     explicit Client(ClientOptions options = {});
@@ -586,6 +781,11 @@ public:
     LaboratoryResource laboratory();
     DietsResource diets();
     AddressesResource addresses();
+
+    /// The company-scoped partner surface (`/outher`). Uses the configured
+    /// `partner_token` instead of a patient login; data is limited to your own
+    /// company and the patient is named inline on each call.
+    PartnerNamespace partner();
 
     /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
     /// typed resource method. The request still goes through the shared transport,

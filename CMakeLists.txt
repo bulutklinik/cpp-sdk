@@ -21,7 +21,7 @@ option(BULUTKLINIK_BUILD_TESTS "Build the test suite" ON)
 if(BULUTKLINIK_BUILD_TESTS)
     enable_testing()
     find_package(Catch2 3 CONFIG REQUIRED)
-    add_executable(bulutklinik_tests tests/test_transport.cpp tests/test_ai.cpp tests/test_lab_diets.cpp)
+    add_executable(bulutklinik_tests tests/test_transport.cpp tests/test_ai.cpp tests/test_lab_diets.cpp tests/test_partner.cpp)
     target_link_libraries(bulutklinik_tests PRIVATE
         bulutklinik_sdk Catch2::Catch2WithMain nlohmann_json::nlohmann_json)
     add_test(NAME bulutklinik_tests COMMAND bulutklinik_tests)
