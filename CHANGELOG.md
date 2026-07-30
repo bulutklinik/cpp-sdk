@@ -4,6 +4,63 @@ All notable changes to the Bulutklinik C++ SDK are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0]
+
+The SDK becomes **partner-only**. Everything that required a patient login is
+gone; the company-scoped `/outher` surface that shipped under `client.partner()`
+in 0.6.0 is now the client root. See `DESIGN.md` §12 for the full migration.
+
+### Changed — BREAKING
+
+- **`client.partner().<group>()` → `client.<group>()`.** The six partner groups
+  (`doctors`, `slots`, `appointments`, `measures`, `laboratory`, `diets`) moved to
+  the root. Their paths, bodies and behaviour are unchanged — this is a rename.
+  Resource classes lost the `Partner` prefix (`PartnerDoctorsResource` →
+  `DoctorsResource`); `PartnerNamespace` is gone.
+- **`TokenStore` now holds one partner token**: `token()` / `set_token()` /
+  `clear()` replace `access_token()` / `refresh_token()` / `set_tokens()`.
+  `InMemoryTokenStore` takes the token as its single constructor argument.
+- **`ClientOptions::partner_token` is now the client's credential** and is
+  required for every call. Setting both `partner_token` and `token_store` throws
+  `std::invalid_argument` from the constructor rather than silently picking one.
+- **No silent refresh.** A `401` / `resultType 4` throws `AuthenticationError`
+  with no retry — a partner token is issued out of band and cannot be renewed
+  from here. Install a newly issued token in the token store instead.
+- **A missing token fails before dispatch** with `AuthenticationError`, rather
+  than sending an anonymous request that returns an opaque `401`.
+- **`Auth` is now `{ Public, Partner }`**; `Auth::Bearer` is gone, and
+  `RequestOptions::auth` defaults to `Auth::Partner`.
+- `MeasuresResource::partner_health_information` →
+  `MeasuresResource::health_information`, now `[[deprecated]]`.
+- `DoctorsResource::search` takes `(search_params, current_page, order_params)`
+  instead of a `SearchInput` — the `/outher` search has no `other_params` or
+  `per_page_limit`, and `order_params` excludes `point`.
+
+### Added
+
+- **`ApiVersion` (`V3` / `V4`) and `ClientOptions::api_version`.** Every path is
+  version-agnostic, so targeting v4 is configuration, not a code change. Default
+  stays `V3`.
+
+### Fixed
+
+- The test suite now compiles. The 0.6.0 partner tests parsed
+  `HttpRequest::body` (a `std::optional<std::string>`) directly, which never
+  built; they use `.value()` now. 0.6.0 shipped without a compile check.
+
+### Removed
+
+- `client.auth()` (all 11 methods), `client.payments()` (5), `client.skin()`,
+  `client.meals()`, `client.addresses()` (4) — no company-scoped equivalent exists.
+- The patient-persona `doctors` / `slots` / `appointments` / `measures` /
+  `laboratory` / `diets` that lived at the root in 0.6.0.
+- `ClientOptions::client_id` / `::client_secret`.
+- The `LoginResult`, `CardInfo`, `RegisterInput`, `VerifyRegistrationInput`,
+  `ConfirmRegistrationEmailInput`, `VerifyRegistrationSocialInput`,
+  `RegisterSocialInput`, `ForgotPasswordInput`, `ResetPasswordInput`,
+  `AddressInput`, `AddressUpdateInput`, `SearchInput`, `PaymentInput`,
+  `MealInput` and `LabOrderInput` types.
+
 ## [0.6.0]
 
 ### Added

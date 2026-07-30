@@ -1,11 +1,18 @@
-# sdk-cpp — Bulutklinik API SDK for C++
+# sdk-cpp — Bulutklinik partner API SDK for C++
 
-Official Bulutklinik API SDK for C++ (C++17). Built on
+Official Bulutklinik **partner** API SDK for C++ (C++17). Built on
 [cpr](https://github.com/libcpr/cpr) (libcurl) + [nlohmann/json](https://github.com/nlohmann/json).
 
-Covers the patient flow: **auth, doctor search, slots, appointments, payments,
-health measures, AI image analysis (skin + meals), lab results, and diet lists**. See
-[`DESIGN.md`](./DESIGN.md) for the full wire contract.
+This is a single-persona SDK: every call runs on the company-scoped `/outher`
+surface with the partner token issued for your integration. You act on the
+patients of **your own company**, and the patient is named inline on each
+request — there is no login and no session. See [`DESIGN.md`](./DESIGN.md) for
+the full wire contract.
+
+> **1.0.0 is a breaking release.** The patient persona (login, registration,
+> payments, AI analysis, address book) has been removed and the former
+> `client.partner()` namespace was lifted to the client root. See
+> [CHANGELOG.md](./CHANGELOG.md) and DESIGN.md §12 for the migration.
 
 ## Install (CMake + vcpkg)
 
@@ -29,104 +36,213 @@ target_link_libraries(your_app PRIVATE bulutklinik::sdk)
 
 ```cpp
 #include <bulutklinik/bulutklinik.hpp>
+#include <cstdlib>
 #include <iostream>
 
 int main() {
     bulutklinik::ClientOptions options;
-    options.environment = bulutklinik::Environment::Production; // Production | Test | Local
-    options.client_id = "clientId";
-    options.client_secret = "clientSecret";
+    options.environment = bulutklinik::Environment::Production;  // Production | Test | Local
+    options.api_version = bulutklinik::ApiVersion::V3;           // V3 (default) | V4
+    if (const char* token = std::getenv("BK_PARTNER_TOKEN")) {
+        options.partner_token = token;
+    }
     bulutklinik::Client client(options);
 
-    // 1) Log in (tokens are stored automatically)
-    auto login = client.auth().connect("patient@example.com", std::string("•••••••"), "email");
-    if (login.two_factor_required) {
-        client.auth().connect_with_two_factor("123456", *login.two_factor_response);
-    }
-
-    // 2) Search — returns an nlohmann::json (the "data" payload)
-    bulutklinik::SearchInput input;
-    input.search_params = {{"withFreeText", "kardiyoloji"}};
-    input.order_params = {"slot"};
-    input.other_params = {"isInterviewable"};
-    auto result = client.doctors().search(input);
-
-    // 3) Slots, then 4) reserve ("YYYY-MM-DD HH:mm")
+    // 1) Find a doctor you can book — returns an nlohmann::json ("data" payload)
+    auto result = client.doctors().search(
+        nlohmann::json{{"withFreeText", "kardiyoloji"}}, 1, {"slot"});
     std::string doctor_id = std::to_string(result["foundDoctors"][0]["doctor_id"].get<int>());
-    auto slots = client.slots().schedule(doctor_id, "interview");
-    client.appointments().reserve_interview(doctor_id, "2026-06-20 14:30");
+
+    // 2) Free slots
+    auto schedule = client.slots().schedule(doctor_id, std::string("2026-08-01"));
+
+    // 3) Hold one for a patient — named inline, no session
+    bulutklinik::Patient user;
+    user.name = "Ada";
+    user.surname = "Lovelace";
+    user.phone_number = "+905551112233";
+    auto held = client.appointments().reserve_without_agreement(slot_id, doctor_id, user);
+
+    // 4) Confirm before held["reservationExpired"] passes
+    client.appointments().create(held["hash"].get<std::string>(),
+                                 held["outherProcessId"].get<std::string>());
 }
 ```
 
 ## Services
 
-| Accessor                  | Methods |
-|---------------------------|---------|
-| `client.auth()`           | `connect`, `connect_with_two_factor`, `verify_registration`, `confirm_registration_email`, `register_patient`, `verify_registration_social`, `register_social`, `forgot_password`, `reset_password`, `refresh`, `disconnect` |
-| `client.doctors()`        | `branches`, `locations`, `quick_search`, `search`, `detail` |
-| `client.slots()`          | `schedule` |
-| `client.appointments()`   | `reserve_interview`, `add_physical`, `cancel`, `list`, `reservations` |
-| `client.payments()`       | `check_discount_code`, `get_cards`, `save_card`, `pay`, `delete_card` |
-| `client.measures()`       | `add_list`, `add`, `update`, `delete_measure`, `last`, `list`, `graph`, `partner_health_information` |
-| `client.skin()`           | `analyze` |
-| `client.meals()`          | `analyze` |
-| `client.laboratory()`     | `results`, `result_detail`, `catalog`, `catalog_detail`, `order` |
-| `client.diets()`          | `list`, `detail` |
-| `client.addresses()`      | `list`, `add`, `update`, `delete_address` |
+28 endpoints across six groups.
 
-Data methods return `nlohmann::json`. (`register_patient` / `delete_measure` /
-`delete_address` are named to avoid the C++ keywords `register` / `delete`.)
+| Group                    | Methods |
+|--------------------------|---------|
+| `client.doctors()`       | `search`, `branches`, `detail`, `locations` |
+| `client.slots()`         | `schedule` |
+| `client.appointments()`  | `reserve`, `reserve_without_agreement`, `instant_reserve`, `create`, `create_without_slot`, `cancel_without_slot`, `list`, `info`, `check_doctor` |
+| `client.measures()`      | `last`, `list`, `graph`, `add_list`, `add`, `update`, `delete_measure`, `health_information` |
+| `client.laboratory()`    | `catalog`, `catalog_detail`, `results`, `result_detail` |
+| `client.diets()`         | `list`, `detail` |
 
-## AI image analysis
+`delete_measure` carries that name because `delete` is a reserved keyword.
 
-Skin-lesion analysis ("Cildimde Neyim Var") and meal-photo calorie/nutrition
-estimation. Both take base64 images and return the `data` payload verbatim; the
-`meals` input maps to the API's snake_case body (`portion_size`, `portion_grams`,
-`meal_type`).
+## Naming a patient
+
+There is no session, so every patient-scoped call carries the patient in its
+body — never in the URL, since a TCKN in a path segment would land in access
+logs, proxy logs and error breadcrumbs.
+
+**Reads** need only the reference fields. The server looks solely inside your own
+company and never creates anything:
 
 ```cpp
-// Skin — a loose array of records (`branch_id` optional)
-auto skin = client.skin().analyze({{{"image", "<base64>"}, {"branch_id", 42}}});
-
-// Meals — a typed input; portion_grams is required when portion_size == "custom"
-bulutklinik::MealInput meal;
-meal.image = "<base64>";
-meal.portion_size = "custom";   // small | medium | large | custom
-meal.portion_grams = 300;
-meal.meal_type = "lunch";       // breakfast | lunch | dinner | snack
-meal.note = "az yağlı";         // optional
-auto meals = client.meals().analyze(meal);
+bulutklinik::Patient reference;
+reference.identity_number = "12345678901";
+client.measures().last(reference);
+client.diets().list(reference);
 ```
 
-## Authentication & tokens
+`identity_number` is primary; `phone_number` is a fallback accepted only when it
+matches exactly one patient (the column is not unique — family members share
+numbers). A patient you have never treated resolves to "not found", with the same
+message as "not yours" so the endpoint cannot be used to probe for TCKNs.
 
-- `connect` / `connect_with_two_factor` / `register_patient` store tokens automatically.
-- On a `401` (or `resultType 4`), the SDK silently refreshes once and retries
-  (thread-safe, single shared refresh).
-- Inject a custom store via `ClientOptions::token_store` (subclass `TokenStore`).
+**Writes** need `name`, `surname` and `phone_number` too, because the patient is
+created inside your company if absent.
+
+## Booking
+
+Two flows, depending on who collects the agreements and the payment:
+
+```cpp
+// (A) Hand off to the patient — returns a browser url for agreements + payment.
+auto held = client.appointments().reserve(slot_id, doctor_id, user);
+
+// (B) You already collected them — returns a hash to confirm yourself.
+auto held = client.appointments().reserve_without_agreement(slot_id, doctor_id, user);
+client.appointments().create(hash, outher_process_id);
+```
+
+**Payment is never taken through the API.** No partner endpoint produces a
+financial record; the browser hand-off in (A) is where payment happens. The SDK
+returns the url verbatim and never opens or follows it.
+
+`create_without_slot` books a free-form range outside the slot grid, for
+integrations running their own calendar; `cancel_without_slot` reverses it — and
+only it.
+
+## Authentication
+
+The partner token is **issued out of band** through the Bulutklinik Developer
+Platform. It behaves like an API key: there is no login method, and the SDK
+cannot renew it.
+
+The token is read from a `TokenStore` on **every** request, so a long-running
+process can pick up a newly issued one without being rebuilt:
+
+```cpp
+class VaultTokenStore : public bulutklinik::TokenStore {
+public:
+    std::optional<std::string> token() const override { /* … */ }
+    void set_token(const std::optional<std::string>& t) override { /* … */ }
+    void clear() override { /* … */ }
+};
+
+options.token_store = std::make_shared<VaultTokenStore>();
+
+// …or rotate the default in-memory store in place:
+client.token_store().set_token(newly_issued_token);
+```
+
+Set `partner_token` **or** `token_store`, not both — the constructor throws
+`std::invalid_argument` rather than guessing which one you meant.
+
+### When the token expires
+
+Tokens last about 30 days. An expired one comes back as `401` / `resultType 4`;
+the SDK throws `AuthenticationError` and does **not** retry — there is nothing to
+refresh. Recovery is operational: obtain a newly issued token and write it into
+the store.
+
+> This is the one behaviour that changed meaning in 1.0.0. On the patient SDK
+> `resultType 4` meant "the SDK will fix this silently". Here it means the opposite.
+
+An `AuthorizationError` (403) means the credential itself is wrong — either the
+token lacks the `apiouther` scope, or it resolves to a user with no company. The
+company boundary comes from the token, never from request input, so retrying with
+different body parameters will not help.
+
+## Health measures
+
+```cpp
+bulutklinik::Patient reference;
+reference.identity_number = "12345678901";
+
+// Write several measurements at once (max 200 per call, one transaction)
+std::vector<nlohmann::json> rows = {
+    {{"type", "tension"}, {"date_time", "2026-06-17 09:30"}, {"hypertension", 120}, {"hypotension", 80}},
+};
+client.measures().add_list(patient, rows);
+
+client.measures().last(reference);
+client.measures().list(reference, "glucose", std::string("1"), 0); // 0=fasting, 1=postprandial
+client.measures().graph(reference, "tension", 2);                  // period 2 = weekly
+```
+
+> Measurements are written to **your own company**. A value you write does not
+> appear in the patient's Bulutklinik mobile app, and values they entered there
+> are not visible to you. That is tenant isolation working as intended.
+
+`measures().health_information` is the legacy `teusan` bulk endpoint, marked
+`[[deprecated]]` and kept for existing integrations: it needs the `teusan` scope
+instead of `apiouther`, takes a flat identity + phone number instead of a patient
+object, and writes into the shared consumer tenant. The API currently matches on
+phone number only (a server-side bug nulls `identity` during validation); pass
+both for forward compatibility. Prefer `add_list` for anything new.
+
+## Escape hatch
+
+Not every endpoint has a typed method. `client.request` reuses the same
+transport, so headers, envelope unwrapping and typed exceptions all still apply:
+
+```cpp
+auto data = client.request("GET", "/outher/somethingNew");
+
+// Auth::Public reaches unauthenticated endpoints outside the partner surface,
+// e.g. the city/district catalogue that feeds address forms.
+bulutklinik::RequestOptions options;
+options.auth = bulutklinik::Auth::Public;
+auto config = client.request("GET", "/general/getConfig", options);
+```
 
 ## Errors
 
-All derive from `bulutklinik::BulutklinikError`: `TransportError` and `ApiError`
-→ `ValidationError` (422), `AuthenticationError` (401 / logout),
-`AuthorizationError` (403), `NotFoundError` (404), `RateLimitError` (429).
-`ApiError` carries `http_status`, `result_type`, `error_type`, `data`, `method`,
-`path`, `retry_after`.
+All exceptions derive from `bulutklinik::BulutklinikError`:
+
+`TransportError` (network) · `ApiError` → `ValidationError` (422),
+`AuthenticationError` (401 / revoked / expired), `AuthorizationError` (403),
+`NotFoundError` (404), `RateLimitError` (429).
+Every `ApiError` carries `http_status`, `result_type`, `error_type`, `data`,
+`method`, `path` and `retry_after`.
 
 ```cpp
 try {
-    client.payments().pay(input);
+    client.measures().last(reference);
 } catch (const bulutklinik::RateLimitError& e) {
-    if (e.retry_after) std::cerr << "retry after " << *e.retry_after << "\n";
-} catch (const bulutklinik::ApiError& e) {
-    std::cerr << e.what() << "\n";
+    std::cerr << "retry after " << e.retry_after.value_or(0) << "\n";
+} catch (const bulutklinik::ValidationError& e) {
+    std::cerr << e.data.dump() << "\n";
 }
 ```
 
-## Payments (3-D Secure)
+Note that `/outher` reports most business-rule failures as HTTP **`501`** with
+`resultType 1` — "patient not found in your company", "slot no longer free",
+"doctor not bookable through your integration". It is not a server crash; read
+the message.
 
-`payments().pay` returns data containing `payment3DUrl` on a 3DS flow — a browser
-URL to open. The bank → server callback completes the capture.
+## Types
+
+Every method returns `nlohmann::json` — the unwrapped `data` payload. Numeric
+ids are passed as `std::string` so they survive round-tripping (a lab result id
+may carry a `-lab` suffix). Optional parameters use `std::optional`.
 
 ## License
 

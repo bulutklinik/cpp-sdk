@@ -6,38 +6,66 @@
 > The canonical copy lives at `dev-kits/DESIGN.md`; an identical copy is vendored
 > into each language repository and re-synced whenever this file changes.
 >
-> Wire contract is derived from `dev-kits/Bulutklinik.postman_collection.json`
-> ("Bulutklinik API — Randevu & Ödeme Akışı"), validated against the BulutklinikAPI
-> source (Laravel 8.12, OAuth2/Passport).
+> Wire contract is derived from the BulutklinikAPI source (Laravel 8.12,
+> OAuth2/Passport) — `app/Packages/Integration/Outher` and `routes/{v3,v4}/outher.php`.
 
-- **Spec version:** 0.6.0 (completes the registration flows and closes flow-gaps found in the API audit: adds `auth.confirmRegistrationEmail` (the e-mail-branch middle step that `register` actually needs), the social sign-up pair `auth.verifyRegistrationSocial`/`auth.registerSocial`, the password-reset pair `auth.forgotPassword`/`auth.resetPassword`, `appointments.list`/`appointments.reservations` (the source of the `event_id` that `cancel` needs), and the new `addresses` group required by `laboratory.order`; 0.5.0 added `auth.verifyRegistration`; 0.4.0 added `laboratory` + `diets`; 0.3.0 added `skin` + `meals`; 0.2.0 added the §7.2 escape hatch)
-- **API:** BulutklinikAPI v3
-- **Scope:** 11 services / 48 endpoints (patient persona). Designed to grow.
+- **Spec version:** 1.0.0 — **breaking.** The SDKs become a single-persona,
+  partner-only surface. Everything that required a patient login is gone; every
+  method now runs on the company-scoped `/outher` channel with a pre-issued
+  partner token. See §12 for what was removed and why.
+- **API:** BulutklinikAPI `v3` (default) or `v4` — selectable per client.
+- **Scope:** 6 services / 28 endpoints (partner persona).
 
 ---
 
 ## 1. Scope
 
-The SDKs cover the patient appointment-and-payment flow, health measurements, and
-AI image analysis:
+The SDKs expose the **partner** persona: a clinic-integration channel where the
+caller is a company, authenticated by a pre-issued partner token, acting on the
+patients of **its own company**.
 
-| Service        | Endpoints | Purpose                                              |
-|----------------|:---------:|------------------------------------------------------|
-| `auth`         | 11        | Login, 2FA, refresh, registration (verify/e-mail-confirm/create), social sign-up, password reset, logout |
-| `doctors`      | 5         | Branches, locations, quick/filtered search, detail   |
-| `slots`        | 1         | Doctor availability (materialized slots)             |
-| `appointments` | 5         | Reserve, physical appointment, cancel, list, reservations |
-| `payments`     | 5         | Discount check, saved cards, pay (3DS)               |
-| `measures`     | 8         | Health measurements (CRUD, list, graph, partner)     |
-| `skin`         | 1         | AI skin-lesion analysis ("Cildimde Neyim Var")       |
-| `meals`        | 1         | AI meal-photo calorie/nutrition estimation           |
-| `laboratory`   | 5         | Lab results, orderable test catalog, test pre-order  |
-| `diets`        | 2         | Diet lists (list + detail) written by the dietitian  |
-| `addresses`    | 4         | The patient's saved addresses (needed by `laboratory.order`) |
+| Service        | Endpoints | Purpose                                                     |
+|----------------|:---------:|-------------------------------------------------------------|
+| `doctors`      | 4         | Doctor discovery: search, branches, detail, city list       |
+| `slots`        | 1         | Doctor availability (materialized slots)                    |
+| `appointments` | 9         | Reserve, confirm, free-form booking, cancel, list, lookup   |
+| `measures`     | 8         | Health measurements for a named patient (read + write)      |
+| `laboratory`   | 4         | Lab results for a named patient + orderable test catalog    |
+| `diets`        | 2         | Diet lists written by a dietitian, for a named patient      |
 
-Out of scope for this collection (may be added later): "Anlık randevu" (programs),
-video-call (calls). The SDK surface is designed so new services slot in as new
-resource groups without breaking existing ones.
+### 1.1 What "partner persona" means
+
+| | partner (this SDK) |
+|---|---|
+| Who authenticates | your **company**, via a pre-issued partner token |
+| Whose data you see | patients of **your own company only** |
+| How a patient is named | **inline on every call** (`patient` / `user` object) — there is no session |
+| Token lifecycle | issued out of band, ~30 days; **the SDK cannot refresh it** (§5.3) |
+
+There is no patient login, no session, and no per-user access token. Two calls
+for two different patients are indistinguishable to the transport — the patient
+reference travels in the request body.
+
+**Patient identity is carried in the body, never in the URL.** A TCKN in a path
+segment would land in access logs, proxy logs and Sentry breadcrumbs. This is why
+several read endpoints are `POST` although they are semantically reads.
+
+### 1.2 Deliberately out of scope
+
+Not exposed, because the API has no company-scoped equivalent:
+
+- **Patient authentication and registration** — login, 2FA, token refresh, sign-up,
+  social sign-up, password reset, logout.
+- **Payments** — discount codes, the saved-card vault, 3-D Secure. Partner booking
+  hands payment off to a browser `url` (§6.3); no partner endpoint produces a
+  financial record.
+- **Self-service AI** — skin-lesion analysis, meal photo analysis.
+- **Patient address book** — it exists only to feed the patient-side lab order,
+  which is itself unavailable to partners.
+- Other partner scopes that exist server-side but are separate integrations:
+  `apilab` (laboratory result write-back), `apidevice` (medical devices), and the
+  plain-`apiusers` doctor-calendar endpoints. These may be added later as their
+  own resource groups.
 
 ---
 
@@ -45,14 +73,24 @@ resource groups without breaking existing ones.
 
 ### 2.1 Base URLs
 
-| Env          | Base URL                                       |
-|--------------|------------------------------------------------|
-| `production` | `https://api.bulutklinik.com/api/v3`           |
-| `test`       | `https://apitest.bulutklinik.com/api/v3`       |
-| `local`      | `https://api-bulutklinik.test/api/v3` (Herd)   |
+The base URL is `<api root>/<apiVersion>`.
 
-The client accepts either a named environment preset or an explicit base URL.
-Default: `production`.
+| Env          | API root                                 |
+|--------------|------------------------------------------|
+| `production` | `https://api.bulutklinik.com/api`        |
+| `test`       | `https://apitest.bulutklinik.com/api`    |
+| `local`      | `https://api-bulutklinik.test/api` (Herd)|
+
+| `apiVersion` | Segment | Notes                                                    |
+|--------------|---------|----------------------------------------------------------|
+| `v3`         | `/v3`   | **Default.** The long-standing surface.                  |
+| `v4`         | `/v4`   | The consolidated architecture. Route-for-route identical for `/outher` — the API's `outher:audit-routes` command enforces v3/v4 parity. |
+
+The client accepts a named environment preset **plus** an `apiVersion`, or an
+explicit `baseUrl` that overrides both. Defaults: `production` + `v3`.
+
+> Every path in §6 is version-agnostic (`/outher/...`); only the base URL differs.
+> Switching `apiVersion` is a configuration change, not a code change.
 
 ### 2.2 Required headers
 
@@ -61,13 +99,13 @@ Default: `production`.
 | `Accept`       | `application/json`             | Always.                                     |
 | `Content-Type` | `application/json`             | On requests with a body.                    |
 | `lang`         | `tr` (default), `en`, `de`, `az` | Configurable per-client and per-request.  |
-| `Authorization`| `Bearer <accessToken>`         | Protected endpoints only. Omitted on public endpoints; partner endpoint uses the partner token. |
+| `Authorization`| `Bearer <partnerToken>`        | On every endpoint in §6.                    |
 
 ### 2.3 HTTP methods
 
 Endpoints use `GET`, `POST`, `PUT`, `DELETE` as specified per endpoint in §6.
-Path parameters (e.g. `{id}`, `{type}`, `{page}`) are URL segments, not query
-string. Request bodies are JSON.
+Path parameters (e.g. `{type}`, `{period}`, `{doctorId}`) are URL segments, not
+query string. Request bodies are JSON.
 
 ---
 
@@ -100,12 +138,24 @@ typed error (§4).
 |:-----:|----------|------------------------------------------------------------------------------|
 | `0`   | Success  | Return `data`.                                                               |
 | `1`   | Error    | Raise `ApiError` (or a more specific subtype based on HTTP status / `errorType`). |
-| `2`   | Logout   | Clear the token store, raise `AuthenticationError` (session revoked).        |
-| `3`   | Update   | Raise `ApiError` with an "update required" marker (client/app too old).      |
-| `4`   | Refresh  | Token expired. **Not** returned by `refreshApi`; returned by the global handler on any protected call that receives an expired/invalid token (HTTP 401). Triggers the auto-refresh+retry flow (§5.4). |
+| `2`   | Logout   | Clear the token store, raise `AuthenticationError` (token revoked).          |
+| `3`   | Update   | Raise `ApiError` with an "update required" marker.                           |
+| `4`   | Refresh  | The partner token is expired or invalid. **There is nothing to refresh** (§5.3) — raise `AuthenticationError` telling the caller to install a newly issued token. |
 
-> Implementation note: `resultType 4` is the canonical refresh signal, but a bare
-> HTTP `401` (without a parseable envelope) MUST be treated identically.
+> Implementation note: `/outher` returns `resultType 4` with HTTP `401` on an
+> expired token. A bare HTTP `401` without a parseable envelope MUST be treated
+> identically. Neither triggers a retry.
+
+### 3.2 The `501` convention
+
+`/outher` reports most business-rule failures as HTTP **`501`** with
+`resultType 1` — "patient not found in your company", "diet list is not yours",
+"slot no longer free", "doctor not bookable through your integration". It is not
+a server crash. Callers should read `errorMessage`, not the status code alone.
+
+The read endpoints deliberately return the **same** message for "this patient is
+not in your company" and "this patient does not exist". Distinguishing them would
+turn the endpoint into a TCKN-probing oracle.
 
 ---
 
@@ -121,317 +171,208 @@ BulutklinikError                  (base — all SDK errors derive from this)
 ├── TransportError                (network failure, timeout, DNS, TLS — no HTTP response)
 └── ApiError                      (got an HTTP response that wasn't a success)
     ├── ValidationError           (422, or errorType=validation)
-    ├── AuthenticationError       (401 / resultType 2 logout / failed refresh)
-    ├── AuthorizationError        (403 — authenticated but not permitted/scoped)
+    ├── AuthenticationError       (401 / resultType 2 / resultType 4 — token invalid, expired or revoked)
+    ├── AuthorizationError        (403 — authenticated but the token lacks the scope, or carries no company)
     ├── NotFoundError             (404)
     └── RateLimitError            (429 — throttled; carries Retry-After if present)
 ```
 
 Each `ApiError` carries: `httpStatus`, `resultType`, `errorType`, `errorMessage`,
 the raw `data`, and the originating request (method + path) for debugging.
-Mapping precedence: logout (`resultType == 2`) → string `errorType == "validation"`
-→ HTTP status (401→Auth, 403→Authz, 404→NotFound, 422→Validation, 429→RateLimit)
-→ otherwise (incl. numeric `errorType`, or success HTTP with `resultType != 0`) → `ApiError`.
+Mapping precedence: logout/expiry (`resultType == 2` or `4`) → string
+`errorType == "validation"` → HTTP status (401→Auth, 403→Authz, 404→NotFound,
+422→Validation, 429→RateLimit) → otherwise (incl. numeric `errorType`, or success
+HTTP with `resultType != 0`) → `ApiError`.
 Because `errorType` may be numeric (§3), guard before string-matching it.
 
----
-
-## 5. Authentication & token lifecycle
-
-OAuth2 via Laravel Passport. Access token lifetime ~30 days, refresh token ~130
-days. The token grant happens server-side inside `connectApi` (no direct
-`oauth/token` HTTP call from the SDK).
-
-### 5.1 Login — `auth.connect`
-
-`POST /general/connectApi` (also aliased at root `/connectApi`). **Public** (no Bearer).
-
-Request body:
-
-| Field             | Required | Notes                                                            |
-|-------------------|:--------:|------------------------------------------------------------------|
-| `apiUserName`     | ✓        | Identifier per `loginMode` (email / TC / phone / user_id).       |
-| `apiUserPassword` | ✓*       | Required except `social` / `afterRegister` modes.                |
-| `apiClientId`     | ✓        | OAuth client id.                                                 |
-| `apiSecretKey`    | ✓        | OAuth client secret.                                             |
-| `loginMode`       | ✓        | `email` \| `identity` \| `phone` \| `user_id` \| `social` \| `afterRegister`. |
-| `withPhoneNumber` | —        | Some installs require it in `phone` mode.                        |
-
-`loginMode` `social` / `afterRegister` skip password validation
-(`validateForPassportPasswordGrant`).
-
-Success → `data: { access_token, refresh_token, password_policy }`. The SDK
-persists both tokens via the token store (§5.5).
-
-**2FA branch:** if SMS 2FA is enabled (`sms_2fa_status=1`), `data.access_token` is
-absent and `data.response` carries an encrypted blob. The SDK surfaces this as a
-*two-factor challenge* (typed result, not an error) so the caller can collect the
-SMS code and call `auth.connectWithTwoFactor`.
-
-### 5.2 2FA verification — `auth.connectWithTwoFactor`
-
-`POST /general/connectApiWithTwoFactor`. **Public** (middleware verifies the SMS code
-inside the encrypted blob).
-
-Request body:
-
-| Field                  | Required | Notes                                          |
-|------------------------|:--------:|------------------------------------------------|
-| `smsVerificationCode`  | ✓        | The code the user received by SMS.             |
-| `response`             | ✓        | The encrypted blob from `connect`'s `data.response`. |
-
-(The collection also sends `tokenInfo`, but the server ignores it — the real token
-is decrypted from `response`. SDKs send only `smsVerificationCode` + `response`.)
-
-Success → `data: { access_token, refresh_token }`. Token is **not** re-minted here;
-it was minted during `connect` and is returned now.
-
-### 5.3 Token refresh — `auth.refresh`
-
-`POST /general/refreshApi`. **Public.** Uses the Passport `refresh_token` grant.
-
-Request body: `{ refreshToken, clientId, clientSecretKey }`.
-Success → `data: { access_token, refresh_token }` (both rotated; persist both).
-
-### 5.4 Silent auto-refresh + retry (mandatory in every SDK)
-
-On any **protected** call:
-
-1. Send the request with the current access token.
-2. If the response is `401` **or** `resultType == 4`, and a refresh token exists,
-   and this request has **not** already been retried:
-   a. Call `auth.refresh` with the stored refresh token + client credentials.
-   b. Persist the new tokens.
-   c. Retry the original request **once**.
-3. If the refresh call itself fails, or `resultType == 2` (logout), clear the
-   token store and raise `AuthenticationError`.
-4. Auto-refresh must be **concurrency-safe**: simultaneous 401s share a single
-   in-flight refresh (no refresh stampede). Single-threaded SDKs (e.g. plain JS)
-   gate on one shared promise; threaded SDKs (Java/C#/Go/C++) use a mutex.
-
-The retry is bounded to one attempt to prevent loops.
-
-### 5.5 Token store (pluggable)
-
-A `TokenStore` abstraction holds the access + refresh tokens. Default
-implementation is in-memory. Consumers may inject a custom store (file, DB,
-secure storage). Required operations (named per language):
-
-- get access token / get refresh token
-- set tokens (access, refresh) — atomically
-- clear (on logout / revoked session)
-
-### 5.6 Registration — `verifyRegistration` → (`confirmRegistrationEmail`) → `register`
-
-Registration is a multi-call flow. `verifyRegistration` returns `confirmationType`:
-
-- **`"sms"`** → feed its `response` + the SMS code straight into `register`.
-- **`"email"`** → the user gets the code by **e-mail**; call `confirmRegistrationEmail`
-  first (it verifies the e-mail code, sends an **SMS** code, and returns a *fresh*
-  `response` blob), then feed that blob + the SMS code into `register`.
-
-⚠️ **A headerless SDK caller always gets `"email"`.** The SMS branch of
-`verifyAddingNewPatient` only triggers when an `appversion` header ≤ 5.27 is present;
-SDKs send no such header, so `confirmRegistrationEmail` is a **required** middle step,
-not optional. `register` (guarded by `checkPhoneVerificationSmsCode`, which requires
-`smsVerificationCode`/`smsVerificationExpire` in the blob) cannot consume the e-mail
-blob directly — it returns 501. (Social sign-up uses a separate 2-step pair, §5.6.4.)
-
-#### 5.6.1 Verify — `auth.verifyRegistration`
-
-`POST /patients/verifyAddingNewPatient`. **Not public** — guarded by
-`auth:apiusers`, so it uses the SDK's **partner** token (the same apiusers bearer as
-`partnerHealthInformation`, no specific scope required here), plus a
-`throttle:perHourFifty` limit. This is the reason the step needs a configured
-`partnerToken`; a patient bearer will **not** satisfy the guard.
-
-Request body: `name`, `surname`, `phoneNumber`, `phone_code`, `email`, `password`,
-`passwordAgain`, `acceptUserAgreement`, one of `g-recaptcha-response-v2` / `captcha`,
-optional `userAgreements[]`.
-
-Rules (validated in `VerifyAddingNewPatientRequest`):
-- `phoneNumber` must match `^[+]([0-9\s\(\)]*)$` and be **unique** in `mbl_users`
-  (this is where duplicate-account detection happens).
-- `phone_code` must match `^\+\d{1,3}$` (e.g. `+90`).
-- `email` is required (modern app versions) and unique in `mbl_users`.
-- `passwordAgain` must equal `password`; the SDKs auto-fill it from `password`.
-- **CAPTCHA is mandatory** (`g-recaptcha-response-v2` *or* `captcha`, required-without
-  each other), validated last via a live Cloudflare/Google call. A pure server-side
-  caller cannot mint this token — it must come from a browser/human. The SDK method is
-  therefore a **thin passthrough**: the caller supplies the captcha token.
-
-Success → `data: { response: "<hashedCode>", confirmationType: "sms" | "email" }`.
-The SDK returns `data` verbatim; feed `response` (and the code the user receives) into
-`register`. The `response` blob is opaque and passed through unchanged (§8.2).
-
-#### 5.6.2 Confirm e-mail — `auth.confirmRegistrationEmail`
-
-`POST /patients/emailConfirmationRegister`. **Public** (guarded by
-`checkEmailVerificationCode` + throttle). Called only when `verifyRegistration`
-returned `confirmationType: "email"`.
-
-Request body: `verificationCode` (the e-mailed code), `response` (the blob from
-`verifyRegistration`), optional `userAgreements[]`. The rest of the profile is
-carried inside the encrypted blob and merged server-side (`prepareForValidation`),
-so the SDK only sends these fields.
-
-Success → `data: { response: "<new SMS blob>", confirmationType: "sms" }`. Feed that
-`response` + the SMS code into `register`.
-
-#### 5.6.3 Create — `auth.register`
-
-`POST /patients/addNewPatient`. **Public** but guarded by SMS verification
-(`checkPhoneVerificationSmsCode`) + throttle.
-
-Request body: `name`, `surname`, `apiUserName`, `phoneNumber`, `password`,
-`smsVerificationCode`, `response` (the SMS blob from the previous step),
-`acceptUserAgreement` (1), `apiClientId`, `apiSecretKey`.
-
-Rules (validated):
-- `phoneNumber` must match `^[+]([0-9\s\(\)]*)$` — i.e. start with `+` and country
-  code (e.g. `+90 555 111 22 33`). Bare digits are rejected.
-- `apiUserName` is used as the `afterRegister` token username; send the **same**
-  `+CC` value as `phoneNumber`, otherwise auto-login mints a wrong/empty token.
-- Password is stored as `Hash::make(BULUT_API_ENC_KEY . password)` (bcrypt rounds=12).
-
-Success → patient created + automatic `afterRegister` login → `data: { access_token, refresh_token }`.
-
-#### 5.6.4 Social sign-up — `verifyRegistrationSocial` → `registerSocial`
-
-A separate **public** 2-step pair for users who authenticate via a social provider.
-Unlike `verifyRegistration`, both are public — **no CAPTCHA and no partner token**.
-
-- `verifyRegistrationSocial` → `POST /patients/verifyAddingNewPatientSocial`. Body:
-  `name`, `surname`, `phoneNumber`, `password`, `passwordAgain`, `socialType`, `key`,
-  optional `email`, `acceptUserAgreement`, `userAgreements[]`. Sends the SMS code →
-  `data: { response }` (note: **no** `confirmationType`).
-- `registerSocial` → `POST /patients/addNewPatientWithSocial` (guarded by
-  `checkPhoneVerificationSmsCode`). Body: `smsVerificationCode`, `response` (blob from
-  the verify step), optional `userAgreements[]`; the profile is merged from the blob.
-  Creates the social patient and its `sec_social_login` link row. **Does not
-  auto-login** — obtain tokens afterwards with `connect({ loginMode: "social" })`.
-
-### 5.7 Logout — `auth.disconnect`
-
-`POST /general/disconnectApi`. **Bearer required** (`auth:patients,apiusers,doctors`).
-Revokes the current access + refresh tokens server-side. The SDK then clears the
-token store. Optional device-token fields (firebase/ios) may be added to the body.
-
-### 5.8 Password reset — `forgotPassword` → `resetPassword`
-
-A **public** 2-step self-service reset flow.
-
-- `forgotPassword` → `POST /patients/forgotPassword`. Body: `phoneNumber` (must be a
-  registered number), optional `birthdate` (`YYYY-MM-DD`; some installs verify it),
-  and one of `g-recaptcha-response-v2` / `captcha` — **CAPTCHA is mandatory outside
-  the local environment** (browser-minted, like `verifyRegistration`). Sends the SMS
-  confirm code → `data: { response }`.
-- `resetPassword` → `PUT /patients/forgotPassword` (guarded by
-  `checkForgotPasswordConfirmSmsCode`). Body: `smsConfirmCode`, `response` (blob from
-  `forgotPassword`), `password`, `passwordAgain`. Sets the new password (keyed by the
-  phone/birthdate carried in the blob). Terminal — returns a success message, no tokens.
+> `403` deserves a note: it is raised not only for a missing `apiouther` scope but
+> also when the token resolves to a user with no company. The company boundary is
+> derived from the authenticated principal, never from request input — so a `403`
+> here means the credential itself is wrong, and retrying with different body
+> parameters will never help.
 
 ---
 
-## 6. Endpoint reference (48)
+## 5. Authentication
+
+### 5.1 The partner token
+
+OAuth2 via Laravel Passport, guard `apiusers`, scope `apiouther` (plus `teusan`
+for `measures.healthInformation`). The token is **issued out of band** — through
+the Bulutklinik Developer Platform, not by any SDK call. There is no
+client-credentials grant the SDK can drive, and no `oauth/token` request.
+
+Consequences the SDKs must honour:
+
+1. The token is a **configuration input**, like an API key.
+2. There is **no login method** on the client.
+3. There is **no auto-refresh** and no retry-after-refresh (contrast: spec 0.x §5.4).
+4. The company the token belongs to is fixed at issue time. It cannot be
+   overridden per request.
+
+### 5.2 Token store (pluggable)
+
+The token is read through a `TokenStore` on **every** request, so a long-lived
+process can rotate the credential without being rebuilt — point the store at a
+file, a database, or a secret manager and the next call picks up the new value.
+
+Required operations (named per language):
+
+| Operation  | Purpose                                                          |
+|------------|------------------------------------------------------------------|
+| get token  | Return the current partner token, or null/empty if none.         |
+| set token  | Replace the stored token (accepts null to unset).                |
+| clear      | Drop the stored token. Called automatically on `resultType 2`.    |
+
+The default implementation is in-memory. The `partnerToken` client option is a
+convenience that seeds one:
+
+```
+new Client({ partnerToken: "…" })           ⇒ in-memory store seeded with the token
+new Client({ tokenStore: myVaultStore })    ⇒ the token comes from your store
+new Client({ partnerToken: …, tokenStore: … })  ⇒ configuration error, raised at construction
+```
+
+Passing both is rejected rather than silently resolved: either the literal or the
+store is the source of truth, and guessing which one the caller meant is how
+credential bugs get shipped.
+
+If no token is available when a request is dispatched, the SDK raises
+`AuthenticationError` **before** touching the network — an unauthenticated call to
+`/outher` would only come back as a confusing `401`/`resultType 4`.
+
+### 5.3 Expiry
+
+Passport issues these tokens with a ~30 day lifetime. When one expires the API
+answers `401` + `resultType 4`; the SDK raises `AuthenticationError` and does
+**not** retry. Recovery is operational: obtain a newly issued token and write it
+into the token store (or rebuild the client). SDK READMEs must say this plainly —
+`resultType 4` used to mean "the SDK will fix this silently" and now means the
+opposite.
+
+---
+
+## 6. Endpoint reference (28)
 
 Notation: **Canonical name** = language-neutral concept → per-language naming
-follows §7. `[public]` = no auth; `[bearer]` = access token; `[partner]` = partner
-token; `[scope:…]` = required OAuth scope.
+follows §7. Every endpoint below requires the partner token; the scope column
+lists the OAuth scope the token must carry.
 
-### 6.1 `auth`
+Two patient-reference shapes recur; both are defined in §8.1.
 
-| Canonical            | Method | Path                               | Auth     |
-|----------------------|--------|------------------------------------|----------|
-| `connect`            | POST   | `/general/connectApi`              | public   |
-| `connectWithTwoFactor`| POST  | `/general/connectApiWithTwoFactor` | public   |
-| `refresh`            | POST   | `/general/refreshApi`              | public   |
-| `verifyRegistration` | POST   | `/patients/verifyAddingNewPatient` | partner  |
-| `confirmRegistrationEmail` | POST | `/patients/emailConfirmationRegister` | public |
-| `register`           | POST   | `/patients/addNewPatient`          | public*  |
-| `verifyRegistrationSocial` | POST | `/patients/verifyAddingNewPatientSocial` | public |
-| `registerSocial`     | POST   | `/patients/addNewPatientWithSocial` | public*  |
-| `forgotPassword`     | POST   | `/patients/forgotPassword`         | public   |
-| `resetPassword`      | PUT    | `/patients/forgotPassword`         | public   |
-| `disconnect`         | POST   | `/general/disconnectApi`           | bearer   |
+- **`patientRef`** — `{ identityNumber?, phoneNumber? }`, at least one. Used by
+  **reads**. Never creates anything.
+- **`bookingUser`** — `{ name, surname, phoneNumber, identityNumber?, email?, birthdate?, nationality?, price? }`.
+  Used by **writes**. Creates the patient in your company if absent.
 
-(Bodies and responses in §5.)
+### 6.1 `doctors`  `[scope:apiouther]`
 
-### 6.2 `doctors`  `[bearer] [scope:patients,bulutweb]`
+| Canonical   | Method | Path                          | Body / params |
+|-------------|--------|-------------------------------|---------------|
+| `search`    | POST   | `/outher/search`              | `searchParams{}` (req), `orderParams[]` (`name`\|`order`\|`slot`), `currentPage` (≥1, req) |
+| `branches`  | GET    | `/outher/branches`            | — |
+| `detail`    | GET    | `/outher/doctorInfos/{doctorId}` | path `doctorId` (req, numeric) |
+| `locations` | GET    | `/outher/locations`           | — |
 
-| Canonical      | Method | Path                                   | Body / params |
-|----------------|--------|----------------------------------------|---------------|
-| `branches`     | GET    | `/patients/allBranches`                | —             |
-| `locations`    | GET    | `/patients/allLocations`               | —             |
-| `quickSearch`  | POST   | `/patients/quickSearch`                | `searchText` (3–100, req), `listType` (`interview`\|`appointment`\|null), `location` (null) |
-| `search`       | POST   | `/patients/filteredSearch`             | `searchParams{}`, `orderParams[]`, `otherParams[]`, `currentPage` (≥1, req), `perPageLimit` (10–100) |
-| `detail`       | GET    | `/patients/doctorDetail/{id}/{corporate?}` | path `id` (req), optional `corporate` |
+- Results are filtered to the doctors enabled for your integration (the server
+  applies your partner slug), so anything returned here is bookable by you.
+  `locations` is the exception: a global city catalogue, not company-scoped.
+- `search.searchParams` accepts the same keys as the patient-side filtered search
+  (`withFreeText`, `withDoctorName`, `withBranchName`, `withBranchId`,
+  `withLocationName`, `withLocationId`, `withCompanyName`, `withCompanyId`,
+  `withGivenTreatments`, `withExpertyId`, `withInstitutionId`,
+  `withNearestSlotDayRange`). Response: `{ foundDoctorsCount, foundDoctors: [ { doctor_id, name, surname, branch_name, … } ] }`.
+  Note `orderParams` here is narrower than the patient surface — `point` is not accepted.
+- `detail` `doctor_id` feeds `slots.schedule` and the booking calls.
 
-- `quickSearch` response: `{ searchedBranches, searchedDoctors, searchedCompanies, searchedGivenTreatments, searchedBlogs, queryText }`; each item `{ result_id, result_text, result_url, result_sub_text, result_type, result_image }`.
-- `search.searchParams` keys: `withFreeText`, `withDoctorName`, `withBranchName`, `withBranchId` (`-1` excludes psychology/diet), `withLocationName`, `withLocationId`, `withCompanyName`, `withCompanyId`, `withGivenTreatments`, `withExpertyId`, `withInstitutionId`, `withNearestSlotDayRange`.
-  `orderParams`: `name` | `point` | `slot` | `order`. `otherParams`: `isKizilay` | `isQuestionable` | `isInterviewable` | `isAppointmentable`.
-  Response: `data: { foundDoctorsCount, foundDoctors: [ { doctor_id, name, surname, branch_name, star_rate, nearest_slot, isInterviewable, isAppointmentable, url, user_image, … } ] }`.
-- `detail` returns `doctorGeneralInfo` (prices, session length, branch), education, languages, reviews, videos, special services, related clinics. The `doctor_id` here feeds later steps.
+### 6.2 `slots`  `[scope:apiouther]`
 
-### 6.3 `slots`  `[bearer]`
+| Canonical  | Method | Path                    | Body |
+|------------|--------|-------------------------|------|
+| `schedule` | POST   | `/outher/doctorSlots`   | `doctorId` (numeric, req); `scheduleDate` (`Y-m-d`, today..+21, optional); `scheduleStep` + `schedulePage` (window paging — both required when `scheduleDate` omitted) |
 
-| Canonical  | Method | Path                          | Body |
-|------------|--------|-------------------------------|------|
-| `schedule` | POST   | `/patients/doctorScheduler`   | `doctorId` (numeric, req); `scheduleDate` (`Y-m-d`, today..+21, optional); `scheduleStep` + `schedulePage` (window paging — both required when `scheduleDate` omitted); `listType` (req: `interview` → online slot_type 1,2; else physical slot_type 0,2) |
+Response: `data` = date-keyed map → for each date
+`[ { slotId, slotStart "HH:mm:ss", slotEnd "HH:mm:ss", available: true } ]`.
+Empty days are `[]`. `slotId` feeds `appointments.reserve`; an
+`appointmentDate` elsewhere is `"Y-m-d H:i"` (date key + `slotStart`, **seconds dropped**).
 
-Response: `data` = date-keyed map → for each date `[ { slotId, slotStart "HH:mm:ss", slotEnd "HH:mm:ss", available: true } ]`. Empty days are `[]`.
-Next step's `appointmentDate` = `"Y-m-d H:i"` (date key + `slotStart`, **drop seconds**).
+Unlike the patient surface there is no `listType` — the partner channel is online
+interviews.
 
-### 6.4 `appointments`  `[bearer] [scope:patients,bulutweb]`
+### 6.3 `appointments`  `[scope:apiouther]`
 
-| Canonical          | Method | Path                                       | Body / params |
-|--------------------|--------|--------------------------------------------|---------------|
-| `reserveInterview` | POST   | `/patients/addInterviewDateReservation`    | `doctorId` (numeric, req), `appointmentDate` (`Y-m-d H:i`, today..+21, req), `appointmentType` (`interview`\|`appointment`, default `interview`) |
-| `addPhysical`      | POST   | `/patients/addNewAppointment`              | `doctorId` (numeric, req), `appointmentDate` (`Y-m-d H:i`, req). No `appointmentType`. |
-| `cancel`           | DELETE | `/patients/deleteUserAppointment/{eventId}`| path `eventId` (= `cln_events.id`) |
-| `list`             | GET    | `/patients/userAppointments/{page?}`       | optional path `page` (paging disabled — page 1 = full list) |
-| `reservations`     | GET    | `/patients/userReservations`               | — |
+| Canonical                | Method | Path                              | Body / params |
+|--------------------------|--------|-----------------------------------|---------------|
+| `reserve`                | POST   | `/outher/reservation`             | `slotId` (req), `doctorId` (req), `user{}` = bookingUser |
+| `reserveWithoutAgreement`| POST   | `/outher/reservationWithoutAgreement` | same as `reserve` |
+| `instantReserve`         | POST   | `/outher/instantReservation`      | `user{}` = bookingUser |
+| `create`                 | POST   | `/outher/appointment`             | `hash` (req), `outherProcessId` (req, numeric) |
+| `createWithoutSlot`      | POST   | `/outher/appointmentWithoutSlot`  | `doctorId` (req), `startDate` (`Y-m-d H:i`, ≥ today, req), `finishDate` (`Y-m-d H:i`, after `startDate`, req), `isOutherDoctor` (0\|1), `user{}` = bookingUser |
+| `cancelWithoutSlot`      | DELETE | `/outher/appointmentWithoutSlot`  | appointment lookup (below) |
+| `list`                   | POST   | `/outher/appointments`            | `phoneNumber` (req), `page` (≥1), `type` (`normal`\|`instant`) |
+| `info`                   | POST   | `/outher/appointmentInfo`         | appointment lookup (below) |
+| `checkDoctor`            | POST   | `/outher/checkDoctor`             | `doctorId` (req, numeric), `isOutherDoctor` (req, 0\|1) |
 
-`reserveInterview` success → `{ resultType: 0, data: null }`; failure → 501.
-`cancel` → 501 for insurance appointments, past cancel-window, or not found.
-Slot is resolved server-side from `doctorId` + `appointmentDate` (no `slotId` in request).
-- `list` → `data: { foundAppointmentsCount, foundAppointments: [ { event_id, event_start_date, doctor_id, doctor_name, doctor_surname, status, amount, online_call, … } ] }`. **`event_id` is the id `cancel` takes**; rows with `event_id == "0"` are paid-order/refund entries (not cancellable) — filter them out.
-- `reservations` → a bare array of active online-slot holds: `{ appoinment_date, doctor_id, doctor_name, doctor_surname, medical_branch_name, minute_diff, second_diff }` (pair `minute_diff`+`second_diff` for a countdown).
+**Appointment lookup** (`info`, `cancelWithoutSlot`) addresses one appointment
+either **by process** — `hash` + `outherProcessId` — or **by coordinates** —
+`doctorId` + `appointmentDate` (`Y-m-d H:i`) + `isOutherDoctor`. Send one pair or
+the other; the server validates them as mutually `required_without`.
 
-### 6.5 `payments`
+**The two booking flows:**
 
-| Canonical          | Method | Path                              | Auth   | Notes |
-|--------------------|--------|-----------------------------------|--------|-------|
-| `checkDiscountCode`| POST   | `/patients/checkDiscountCode`     | bearer | **`patients` prefix, not `payments`.** |
-| `getCards`         | GET    | `/payments/getCards`              | bearer | |
-| `saveCard`         | POST   | `/payments/saveCard`              | bearer | Flat fields (not nested). |
-| `pay`              | POST   | `/payments/interviewPayment`      | bearer | Throttle 20/h/IP. Returns `payment3DUrl`. |
-| `deleteCard`       | DELETE | `/payments/deleteCard/{cardId}`   | bearer | path `cardId` |
+```
+(A) hand off to the patient      reserve  ──▶ data.url  ──▶ patient opens it in a
+                                                            browser: agreements + payment
+(B) you collected the agreements  reserveWithoutAgreement ──▶ data.hash
+                                          └─▶ create(hash, outherProcessId) ──▶ appointment
+```
 
-- `checkDiscountCode` body: `checkType` (`question`\|`appointment`\|`lab`\|`special`\|`physicallyAppointment`\|`tmcLab`\|`program`), `doctorId` (required except lab/tmcLab/program), `discountCode` (req), plus `orderId`/`specialServiceId`/`programSlug` per type. Valid → `data: { discount_code, discount_title, discount_id, prices }`.
-- `getCards` → `data.cards[]: { id, card_holder_name, card_number (masked), card_type, created_at }`. `id` → `cardId`.
-- `saveCard` body (flat, `SavePatientCardRequest`): `cardHolder`, `cardNumber`, `cardExpMonth` (`m`), `cardExpYear` (`Y`), `cardCvv` — all required.
-- `pay` body: `doctorId` (req), `appointmentDate` (`Y-m-d H:i`, req), `appointmentType` (`interview`→order_type 0 / `appointment`→3), `is3D` (bool, req), `termsAccept` (accepted, req), `saveCard` (1=tokenize), `discountCode` (opt), `caseDetail` (opt, encrypted), **and** either `cardInfo{ cardHolder, cardNumber, cardExpMonth, cardExpYear, cardCvv }` (all-or-none) **or** `cardId` (saved card). Amount is computed server-side (no `amount` in request).
-- `pay` response: see §8.1 (`payment3DUrl` handling).
+- `reserve` → `{ url, hash }`. `url` is a short link to the Bulutklinik agreement
+  and payment page; hand it to the patient. The SDK returns it verbatim and never
+  opens or follows it.
+- `reserveWithoutAgreement` → `{ hash, doctorId, slotId, phoneNumber, reservationExpired }`.
+  `reservationExpired` (`Y-m-d H:i:s`) is the hold deadline — `create` after it
+  passes fails with `501`.
+- `instantReserve` → `{ url }`. No slot: the server picks an available doctor.
+- `create` → the appointment record plus `last_delete_time` (the cancellation
+  deadline).
+- `createWithoutSlot` books a free-form range outside the slot grid, for
+  integrations running their own calendar. `cancelWithoutSlot` reverses it — and
+  **only** it; appointments created through `create` are not cancellable here.
+- `list` returns the appointments **you** created for that phone number, not the
+  patient's full history across the platform.
+- `checkDoctor` → `{ title, name, surname, branch_name, state: "1" }` when the
+  doctor is bookable through your integration; `501` when not. Call it before
+  showing a doctor as reservable.
 
-### 6.6 `measures`
+> Completing a payment (`outherProcess`) is **not** on the partner surface: those
+> routes require a `patients`/`bulutweb` scope. Flow (A) exists precisely because
+> the browser hand-off is where payment happens.
 
-Patient endpoints `[bearer] [scope:patients]`; partner endpoint `[partner] [scope:teusan]`.
-Records are written to the authenticated patient (`bas_com_company_id` from token).
+### 6.4 `measures`  `[scope:apiouther]` (`healthInformation`: `[scope:teusan]`)
 
-| Canonical                  | Method | Path                                                 | Body / params |
-|----------------------------|--------|------------------------------------------------------|---------------|
-| `addList`                  | POST   | `/patients/addNewUserMeasures`                       | `data[]` — each item: `type` + that type's fields + `date_time`. **Primary "submit health data" endpoint.** |
-| `add`                      | POST   | `/patients/addNewUserMeasures/{type}`                | path `type`; body: `date_time` + type fields |
-| `update`                   | PUT    | `/patients/updateUserMeasures/{type}`                | path `type`; body: `id` (req) + fields + `date_time` |
-| `delete`                   | DELETE | `/patients/deleteUserMeasures/{type}`                | path `type`; body: `id` (req) |
-| `last`                     | GET    | `/patients/measuresList`                             | Latest value per type. |
-| `list`                     | GET    | `/patients/userMeasuresList/{type}/{page}/{glucoseType?}` | path; `glucoseType` 0/1 only for glucose |
-| `graph`                    | GET    | `/patients/userMeasuresGraph/{type}/{period}/{page}/{glucoseType?}` | `period` 1=day,2=week,3=month,4=year |
-| `partnerHealthInformation` | POST   | `/outher/healthInformation`                          | partner token; body: `identity`, `phoneNumber`, `data[]` |
+Reads resolve the patient inside your company and never create one. Writes create
+the patient if needed. **Measurements are written to your own company** — a value
+you write does not appear in the patient's Bulutklinik mobile app. That is the
+intended consequence of tenant isolation, not a bug.
 
-`addList` runs in a DB transaction; submit multiple measurements in one call.
-`last` returns the most-recent of each type (tension splits into hypertension/hypotension; glucose splits into `hunger_glucose`/`postprandial_glucose`), each with a `*Date`.
+| Canonical           | Method | Path                                          | Body / params |
+|---------------------|--------|-----------------------------------------------|---------------|
+| `last`              | POST   | `/outher/lastMeasures`                        | `patient{}` = patientRef |
+| `list`              | POST   | `/outher/measuresList/{type}`                 | path `type`; `patient{}` = patientRef, `currentPage` (≥1), `glucoseType` (0\|1, glucose only) |
+| `graph`             | POST   | `/outher/measuresGraph/{type}/{period}`       | path `type`, `period` (1=day,2=week,3=month,4=year); `patient{}` = patientRef, `currentPage`, `glucoseType` |
+| `addList`           | POST   | `/outher/measures`                            | `patient{}` = bookingUser, `data[]` (1–200 items) — each item `type` + that type's fields + `date_time` |
+| `add`               | POST   | `/outher/measure/{type}`                      | path `type`; `patient{}` = bookingUser, `date_time` + type fields |
+| `update`            | PUT    | `/outher/measure/{type}`                      | path `type`; `patient{}` = patientRef, `id` (req) + fields + `date_time` |
+| `delete`            | DELETE | `/outher/measure/{type}`                      | path `type`; `patient{}` = patientRef, `id` (req) |
+| `healthInformation` | POST   | `/outher/healthInformation`                   | `identity`, `phoneNumber`, `data[]` — legacy flat contract, **not** `patient{}` |
+
+- `addList` writes every row in **one transaction**, capped at **200 items** —
+  without a cap a single request would hold a transaction open across thousands of
+  rows and block on the `med_monitor_*` tables.
+- `update`/`delete` take the read-side `patient{}` (if there is a row to change,
+  the patient already exists) and bound the write to `id` + patient + company.
+- `id` for `update`/`delete` comes from `list`.
 
 **Measure type schema** (every record also requires `date_time` = `"Y-m-d H:i"`):
 
@@ -451,157 +392,100 @@ Records are written to the authenticated patient (`bas_com_company_id` from toke
 | `step`    | `step`                                              |
 | `sleep`   | `sleep` (hours; stored to `sleep_time`)             |
 
-Value rules: numeric; `tension`/`pulse` digits 1–10; `glucose` 0–99999.99 + `glucose_type` 0\|1; `weight`/`length` 0–99999.99; etc.
+Value rules: numeric; `tension`/`pulse` digits 1–10; `glucose` 0–99999.99 +
+`glucose_type` 0\|1; `weight`/`length` 0–99999.99; etc.
 
-> **Known API bug (document, don't replicate):** for the partner endpoint,
+`last` returns the most recent of each type (tension splits into
+hypertension/hypotension; glucose into `hunger_glucose`/`postprandial_glucose`),
+each with a `*Date`.
+
+> **`healthInformation` is the odd one out.** It predates the `patient{}`
+> contract, needs the `teusan` scope instead of `apiouther`, and takes a flat
+> `identity` + `phoneNumber`. Prefer `addList` for new integrations.
+>
+> **Known API bug (document, don't replicate):** for `healthInformation`,
 > `AddNewUserMeasuresListRequest::prepareForValidation` reads `identity` from
 > `$this->message` instead of `$this->identity`, nulling it during validation; in
 > practice matching falls back to `phoneNumber`. The SDK sends the correct
-> contract (`identity` + `phoneNumber`) and notes this in the README.
+> contract and notes this in the README.
 
-### 6.7 `skin`  `[bearer] [scope:patients]`
+### 6.5 `laboratory`  `[scope:apiouther]`
 
-"Cildimde Neyim Var" — AI skin-lesion analysis. Submit one or more skin photos; each is
-classified (lesion `label`), given a patient-friendly Turkish AI `comment`, image-quality
-flags, a `confidence`, possible ICD hints and an opaque `case_detail` blob.
+| Canonical       | Method | Path                                  | Body / params |
+|-----------------|--------|---------------------------------------|---------------|
+| `catalog`       | GET    | `/outher/laboratoryCatalog`           | — |
+| `catalogDetail` | GET    | `/outher/laboratoryCatalog/{testId}`  | path `testId` (req, numeric) |
+| `results`       | POST   | `/outher/laboratoryResults`           | `patient{}` = patientRef, `currentPage` (≥1) |
+| `resultDetail`  | POST   | `/outher/laboratoryResult`            | `patient{}` = patientRef, `testId` (req) |
 
-| Canonical | Method | Path                   | Body |
-|-----------|--------|------------------------|------|
-| `analyze` | POST   | `/patients/imageCheck` | `images[]` — each item `{ image (base64, req), branch_id? }` |
+- `catalog` / `catalogDetail` are the **global orderable-test catalogue** — static
+  data, no patient and no company scoping.
+- `resultDetail.testId` must be passed back **exactly** as `results` returned it:
+  a plain number is an HBYS lab request, a `-lab` suffix marks a TmcLab order
+  group (server pattern: `/^\d+(-lab)?$/`). The SDK does not parse or normalise it.
+- Ordering a test is **not** available to partners (it creates a financial record).
 
-Request: `{ "images": [ { "image": "<base64>", "branch_id"?: <int> } ] }`. `image` is a
-base64-encoded JPEG/PNG/WebP/HEIC (a `data:…;base64,` prefix is accepted). `branch_id`
-optionally tags the stored media with a clinic branch. Mirrors `measures.addList` — a
-loose array of records.
+### 6.6 `diets`  `[scope:apiouther]`
 
-Response `data`: `{ status: [ { id, isClear, isBright, label, comment, confidence, image, error, possible_icd, case_detail } ] }` — one entry per submitted image, `id` = 1-based index:
-- `label` — lesion class from the classifier (may be empty).
-- `comment` — patient-friendly Turkish AI summary.
-- `isClear` / `isBright` — image-quality flags.
-- `confidence` — classifier confidence (0–1) or null.
-- `image` — stored media relative path.
-- `possible_icd` — candidate ICD code(s) or null.
-- `case_detail` — opaque base64-encrypted blob identifying the saved case (§8.2); can be forwarded verbatim as a payment's `caseDetail`.
-- `error` — per-image error message or null.
+| Canonical | Method | Path                 | Body |
+|-----------|--------|----------------------|------|
+| `list`    | POST   | `/outher/dietLists`  | `patient{}` = patientRef, `currentPage` (≥1) |
+| `detail`  | POST   | `/outher/diet`       | `patient{}` = patientRef, `listId` (req, numeric) |
 
-The SDK returns `data` verbatim (a mostly-untyped map) and never decrypts `case_detail`.
-On a gateway failure the API still returns `status` entries with empty label/comment, so
-callers should treat all fields as optional.
-
-### 6.8 `meals`  `[bearer] [scope:patients]`
-
-AI meal-photo calorie/nutrition estimation — sibling of `skin` (same controller, different
-domain).
-
-| Canonical | Method | Path                         | Body |
-|-----------|--------|------------------------------|------|
-| `analyze` | POST   | `/patients/imageAnalyzeMeal` | `image` (base64, req), `portionSize` (req), `portionGrams?`, `mealType` (req), `note?` |
-
-The SDK input names map to the API's snake_case body
-`{ image, portion_size, portion_grams?, meal_type, note? }` (like `payments.pay`, a typed
-single input):
-- `portion_size` ∈ `small | medium | large | custom` (required).
-- `portion_grams` — required only when `portion_size` is `custom`.
-- `meal_type` ∈ `breakfast | lunch | dinner | snack` (required).
-- `note` — optional free text (≤1000 chars); the model reads Turkish preparation/portion modifiers.
-
-Response `data`: `{ status: { comment: "<json string>" } }` — `comment` is the model's
-nutrition breakdown (a JSON-object string, per the server prompt); the SDK returns it
-verbatim.
-
-### 6.9 `laboratory`  `[bearer] [scope:patients]`
-
-The patient's own laboratory results, the orderable test catalog, and test pre-ordering.
-The controller (`v3\General\Laboratory`) is `@hideFromAPIDocumentation`, so this group is
-hand-written from the API source, not the auto-docs.
-
-| Canonical       | Method | Path                                          | Body / params |
-|-----------------|--------|-----------------------------------------------|---------------|
-| `results`       | GET    | `/patients/userLabTestList/{page?}`           | optional `page` (default 1). The patient's completed/in-progress lab results. |
-| `resultDetail`  | GET    | `/patients/userLabTestDetail/{testId}`        | path `testId` (**string**) — pass the id from a `results` item verbatim. |
-| `catalog`       | GET    | `/patients/allLaboratoryTests`                | — (orderable test-group catalog). |
-| `catalogDetail` | GET    | `/patients/laboratoryTestDetail/{id}`         | path `id` (numeric) — one catalog group. |
-| `order`         | POST   | `/patients/addNewLaboratoryTest`              | `testId` (numeric, req), `addressId` (numeric, req), `laboratoryId` (numeric, req). |
-
-- `results` `data`: `{ foundTestsCount, foundTests: [ { id, created_at, company_name, test_name, test_state, test_state_text, test_type, test_type_text } ] }`. `test_state` 0=Numune Alınıyor, 1=Çalışıyor, 2=Onaylandı; `test_type` 1=Normal, 2=Grup, 3=Alt Parametre. The list also unions in TMC-lab-ordered tests whose `id` carries a `-lab` suffix (e.g. `"4821-lab"`).
-- `resultDetail`: `{testId}` may be a plain id (`"123"`, DB path) or `"<id>-lab"` (TMC-lab path). `data` fields: `test_name, protocol_no, id, created_at, company_name, result, result_unit, test_state, test_state_text, test_type, test_type_text, result_type_text, sub_tests`. For `test_type == 1` the payload adds `normal_lower_limit, normal_upper_limit, panic_lower_limit, panic_upper_limit` (age/gender-aware). For `test_type == 2`, `sub_tests[]` carries per-parameter results plus those four limit fields.
-- `catalog` returns `test_groups[]`: each `{ id, name, image, background, desc (HTML), tests[]{id,name}, laboratories[]{ company_id, name, doctor_id, branch_id, prices{ real_price, discount_rate, discounted_price, discount_code, discount_title, discount_id }, cities[]{id,name} } }`. Served from `config/laboratory.php`, not the DB.
-- `catalogDetail` returns the single matching group; for `pat` users the per-laboratory `prices` are recomputed through the discount provider.
-- `order` success → `data: { preOrderId }`. Validated against the catalog (`test_not_found`, `laboratory_not_found`), the user address (`user_address_not_found`, `invalid_user_address_for_lab` — the address city must be served by the lab), and duplicate open orders. Business failures return HTTP 501.
-- **Not exposed:** the deprecated `POST /patients/addNewLabTest` (superseded by `order`), and the `results` endpoint's optional `companyId` query filter (SDKs use path params only, and that server-side filter is known-buggy).
-
-### 6.10 `diets`  `[bearer] [scope:patients]`
-
-The patient's diet lists (a dietitian's "Diyet Listesi"). Controller `v3\General\Diets`,
-`@hideFromAPIDocumentation`. JSON only — the server's PDF export (`dietFile`) is out of SDK scope
-(it returns a binary `application/pdf`, not the envelope).
-
-| Canonical | Method | Path                              | Body / params |
-|-----------|--------|-----------------------------------|---------------|
-| `list`    | GET    | `/patients/dietLists/{page?}`     | optional `page` (default 1). Page size is fixed to 10 server-side. |
-| `detail`  | GET    | `/patients/diet/{listId}`         | path `listId` (numeric) = a `list_id` from a `list` item. |
-
-- `list` `data`: `{ foundDietsCount, foundDiets: [ { list_id, diet_date, protocol_no, patient_name, patient_surname, patient_birthdate, patient_identity_no, doctor_company_name, doctor_name, doctor_surname, doctor_title, doctor_branch_name, doctor_image } ] }`. One entry per diet-program group; `list_id` feeds `detail`.
-- `detail` `data`: an **array of meal-time groups** `[ { time, meals: [ { meal_time, total_calories, protocol_no, patient_*, doctor_company_name, diet_date, doctor_name, doctor_surname, doctor_title, doctor_image, doctor_certified_number, doctor_branch_name, meal_details: [ { quantity, explanation, meal_name, kcal, unit } ] } ] } ]`. An empty diet returns HTTP 501.
-
-### 6.11 `addresses`  `[bearer] [scope:patients]`
-
-The patient's saved addresses. **Required by `laboratory.order`**, whose `addressId`
-must reference one of these (and whose `city_id` must be in the lab's served cities).
-All four verbs are the same path `/patients/userAddress` (distinguished by method).
-
-| Canonical | Method | Path                     | Body / params |
-|-----------|--------|--------------------------|---------------|
-| `list`    | GET    | `/patients/userAddress`  | — |
-| `add`     | POST   | `/patients/userAddress`  | `title` (req), `cityId` (req, numeric), `districtId` (req, numeric), `address` (req), `locationLat` (req), `locationLng` (req), `description?`, `isDefault?` (0\|1) |
-| `update`  | PUT    | `/patients/userAddress`  | `id` (req); `title`/`cityId`/`districtId`/`address`/`locationLat`/`locationLng` are `required_without:isDefault`; `description?`, `isDefault?` |
-| `delete`  | DELETE | `/patients/userAddress`  | `id` (req, in the **body** — not a path segment) |
-
-- `list` → a bare array (default first): `{ id, title, description, city_id, district_id, address, location_lat, location_lng, is_default, distinct_name }`. **`id` is the `addressId`** used by `update`/`delete`/`laboratory.order`. Returns 501 when the patient has no addresses (treat as "empty"). Only the district name is joined — map `city_id`→name via `doctors.locations`.
-- `add` → `data: { addressId }`. The first address is forced default; setting `isDefault: 1` demotes the previous default.
-- `update`/`delete` → message only (no `data`). The **default address cannot be deleted** (reassign via `update` first), nor can an address already used on an order.
-- `cityId` comes from `doctors.locations` (`location_id`); `districtId` comes from `GET /getConfig` (`cities[].districts[].district_id`), reachable via the §7.2 escape hatch.
+- `list` → `{ foundDietsCount, foundDiets: [ { list_id, diet_date, protocol_no, patient_*, doctor_* } ] }`.
+  Page size is fixed to 20 server-side. `list_id` feeds `detail`.
+- `detail` → an **array of meal-time groups**
+  `[ { time, meals: [ { meal_time, total_calories, …, meal_details: [ { quantity, explanation, meal_name, kcal, unit } ] } ] } ]`.
+  A `listId` that is not this patient's returns `501` with the generic message.
 
 ---
 
 ## 7. Naming conventions & API shape
 
 The client is a single root object exposing one accessor per service group; each
-group exposes the canonical methods above.
+group exposes the canonical methods above. **There is no namespace prefix** — the
+partner surface *is* the surface.
 
 ```
-client.auth.connect(...)            client.payments.pay(...)
 client.doctors.search(...)          client.measures.addList(...)
-client.slots.schedule(...)          client.appointments.reserveInterview(...)
-client.skin.analyze(...)            client.meals.analyze(...)
-client.laboratory.results(...)      client.diets.list(...)
+client.slots.schedule(...)          client.laboratory.results(...)
+client.appointments.reserve(...)    client.diets.list(...)
 ```
 
 Per-language casing & idioms:
 
 | Language | Method case | Notes |
 |----------|-------------|-------|
-| JS/TS    | `camelCase` | `client.doctors.quickSearch()`. Promise-based. |
-| PHP      | `camelCase` | `$client->doctors->quickSearch()`. Namespace `Bulutklinik\Sdk`. |
-| Python   | `snake_case`| `client.doctors.quick_search()`. Sync **and** async (`AsyncClient`). |
-| Go       | `PascalCase`| `client.Doctors.QuickSearch(ctx, …)`. Context-first, `(T, error)` returns. |
-| Java     | `camelCase` | `client.doctors().quickSearch(…)`. Builder for config; checked vs unchecked TBD in Faz 3. |
-| C#       | `PascalCase`+`Async` | `client.Doctors.QuickSearchAsync(…)`. `Task<T>`, `CancellationToken`. |
-| C++      | `snake_case`| `client.doctors().quick_search(…)`. Namespace `bulutklinik`. cpr + nlohmann/json. |
+| JS/TS    | `camelCase` | `client.doctors.search()`. Promise-based. |
+| PHP      | `camelCase` | `$client->doctors->search()`. Namespace `Bulutklinik\Sdk`. |
+| Python   | `snake_case`| `client.doctors.search()`. Sync **and** async (`AsyncClient`). |
+| Go       | `PascalCase`| `client.Doctors.Search(ctx, …)`. Context-first, `(T, error)` returns. |
+| Java     | `camelCase` | `client.doctors().search(…)`. Builder for config. |
+| C#       | `PascalCase`+`Async` | `client.Doctors.SearchAsync(…)`. `Task<T>`, `CancellationToken`. |
+| C++      | `snake_case`| `client.doctors().search(…)`. Namespace `bulutklinik`. cpr + nlohmann/json. |
 
 Request inputs are typed structures (objects/records/structs) per language;
 responses are typed where practical, otherwise a typed envelope + parsed `data`.
+
+Where a method name would collide with a language keyword, the language's own
+escape applies — e.g. C++ `measures.delete_measure(...)`, since `delete` is
+reserved.
 
 ### 7.1 Client configuration
 
 | Option        | Default        | Purpose                                            |
 |---------------|----------------|----------------------------------------------------|
-| `environment` / `baseUrl` | `production` | Named preset or explicit URL.            |
+| `environment` | `production`   | Named preset (`production` \| `test` \| `local`).   |
+| `apiVersion`  | `v3`           | `v3` \| `v4`. Combined with `environment` to build the base URL. |
+| `baseUrl`     | —              | Explicit URL; overrides `environment` + `apiVersion`. |
 | `lang`        | `tr`           | Default `lang` header; overridable per request.    |
-| `clientId` / `clientSecret` | —  | Needed for `refresh` (and passed by `connect`).    |
-| `tokenStore`  | in-memory      | Pluggable persistence.                             |
+| `partnerToken`| —              | The partner token. Seeds the default in-memory store. |
+| `tokenStore`  | in-memory      | Pluggable token source (§5.2). Mutually exclusive with `partnerToken`. |
 | `timeout`     | sane default   | Request timeout.                                   |
 | `httpClient`  | platform default | Injectable transport (PSR-18, http.Client, HttpClient, etc.). |
+
+`clientId` / `clientSecret` are **gone** — they existed only for the patient
+password and refresh grants.
 
 ### 7.2 Escape hatch — arbitrary requests
 
@@ -609,8 +493,7 @@ Not every endpoint has a typed resource method, and the API grows faster than th
 SDK surface. Every SDK therefore exposes **one generic request method on the root
 client** for calling any Bulutklinik API endpoint directly. It is not a separate
 HTTP client: it reuses the same transport, so default headers, the chosen auth
-mode, silent token refresh + retry (§5.4), envelope unwrapping (§3) and the typed
-error hierarchy (§4) all still apply.
+mode, envelope unwrapping (§3) and the typed error hierarchy (§4) all still apply.
 
 Concept:
 
@@ -621,65 +504,69 @@ client.request(method, path, { auth, body, lang }) -> data
 | Param    | Notes |
 |----------|-------|
 | `method` | `GET` \| `POST` \| `PUT` \| `DELETE`. |
-| `path`   | Relative to the configured base URL, e.g. `/patients/allBranches`. Leading slash included. |
-| `auth`   | `public` \| `bearer` (**default**) \| `partner`. Accepted as a string or an existing public enum/const per language. |
+| `path`   | Relative to the configured base URL, e.g. `/outher/branches`. Leading slash included. |
+| `auth`   | `partner` (**default**) \| `public`. Accepted as a string or an existing public enum/const per language. |
 | `body`   | Optional JSON payload (object/map/dict). Omitted on `GET`. |
 | `lang`   | Optional per-request `lang` override, where the SDK's transport supports one (JS, PHP, Go, C++). Python / Java / C# apply the client-level `lang`. |
 
-Returns the unwrapped `data` payload as the language's raw JSON value (the same
-type a future typed resource method would parse from), and raises the same typed
-errors on failure. Representative per-language signatures (idiomatic, return the
-raw `data`):
+Returns the unwrapped `data` payload as the language's raw JSON value, and raises
+the same typed errors on failure. Representative per-language signatures:
 
 | Language | Signature |
 |----------|-----------|
 | JS/TS    | `client.request<T>({ method, path, auth?, body?, lang? }): Promise<T>` |
-| Python   | `client.request(method, path, *, auth="bearer", body=None)` — plus the async client |
-| PHP      | `$client->request(string $method, string $path, string $auth = 'bearer', ?array $body = null, ?string $lang = null): mixed` |
-| Go       | `client.Do(ctx, method, path, *bk.RequestOptions) (json.RawMessage, error)` (nil options ⇒ bearer) |
+| Python   | `client.request(method, path, *, auth="partner", body=None)` — plus the async client |
+| PHP      | `$client->request(string $method, string $path, string $auth = 'partner', ?array $body = null, ?string $lang = null): mixed` |
+| Go       | `client.Do(ctx, method, path, *bk.RequestOptions) (json.RawMessage, error)` (nil options ⇒ partner) |
 | Java     | `client.request(String method, String path, String auth, Object body)` → `JsonNode` |
-| C#       | `client.RequestAsync(HttpMethod method, string path, string auth = "bearer", object? body = null, CancellationToken = default)` → `JsonElement` |
+| C#       | `client.RequestAsync(HttpMethod method, string path, string auth = "partner", object? body = null, CancellationToken = default)` → `JsonElement` |
 | C++      | `client.request(method, path, bulutklinik::RequestOptions{})` → `nlohmann::json` |
 
-This is the supported extension point for endpoints outside the 29 in §6. Prefer a
-typed resource method when one exists; reach for `request` only for the gaps.
+`auth: "public"` exists for the handful of unauthenticated endpoints outside §6
+that an integration may still need — e.g. `GET /general/getConfig` for the
+`cities[].districts[]` list. Prefer a typed resource method when one exists.
 
 ---
 
 ## 8. Special cases
 
-### 8.1 `payment3DUrl` (3-D Secure) — passthrough
+### 8.1 How a patient reference resolves
 
-`pay` success response: `{ resultType: 0, data: { payment3DUrl: "<url>" } }`.
-`payment3DUrl` is a **browser URL** the SDK returns verbatim — it is one of:
-  (A) the bank's direct `URL_3DS`, or
-  (B) `{APP_URL}/api/v3/payments/threeDUrl/<token>` (our endpoint serving the 3DS HTML form).
+This is the single most important behaviour on the partner surface, and the two
+paths are deliberately asymmetric.
 
-The SDK **does not** open, follow, or parse it. 3DS completion ("provizyon
-kapatma" / capture) happens browser↔bank↔server via the
-`POST /api/v3/threeD/appointmentPaymentComplete/{trxId}/{driver}` callback
-(`trxId = "{orderId}.{transactionUuid}.{processId}"`) — outside SDK scope.
-If `is3D = false`, `data` is the inline-completed order result (no `payment3DUrl`).
+**Read path** (`patientRef` — `measures.last`/`list`/`graph`/`update`/`delete`,
+`laboratory.results`/`resultDetail`, `diets.list`/`detail`):
 
-### 8.2 Encrypted blobs — passthrough
+1. Searches **only** `pat_patients` rows belonging to your company. It never
+   consults the global user table and **never creates** anything.
+2. `identityNumber` (TCKN) is the primary selector.
+3. `phoneNumber` is the fallback — used when no TCKN was sent, **or** when the
+   TCKN missed (a patient you created without a TCKN is findable once you learn
+   it). It is accepted only when it matches **exactly one** row; the column is not
+   unique, since family members share numbers. Two matches fail closed.
+4. When the fallback fires and the matched row has a *different* non-empty
+   `identity_number`, the request is rejected — that is a different person.
+5. Not found → `501` with the same generic message as "not yours" (§3.2).
 
-`connect`'s `data.response` (2FA), `register`'s `response`, `caseDetail`, and the
-`case_detail` returned by `skin.analyze` are opaque encrypted blobs. The SDK passes
-them through verbatim and never encrypts or decrypts — a `skin.analyze` `case_detail`
-may be forwarded unchanged as a payment's `caseDetail`. The clinic/API encryption keys
-are never embedded in the SDK.
+**Write path** (`bookingUser` — every booking call, `measures.addList`/`add`):
 
-### 8.3 Public vs bearer vs partner
+1. Looks the person up globally by TCKN/phone and creates a password-less shadow
+   user if absent.
+2. Find-or-creates the `pat_patients` row **in your company**.
+3. This is why the descriptive fields (`name`, `surname`, `phoneNumber`) are
+   required here and absent from the read shape.
 
-- Public (no `Authorization`): `connect`, `connectWithTwoFactor`, `refresh`, `register`,
-  `confirmRegistrationEmail`, `verifyRegistrationSocial`, `registerSocial`,
-  `forgotPassword`, `resetPassword`. (`forgotPassword` still requires a browser CAPTCHA
-  token; the social pair does not.)
-- Bearer (access token): everything else (incl. `appointments.*` and the `addresses` group).
-- Partner: `partnerHealthInformation` (`scope:teusan`) and `verifyRegistration`
-  (`auth:apiusers`, no specific scope) use the separately-configured partner token,
-  not the patient access token. **Only these two** need the partner token — the social
-  registration verify step is public, unlike the non-social `verifyRegistration`.
+The company boundary always comes from the authenticated token, never from
+request input. There is no parameter that lets a partner read another company's
+data — including no `companyId` field to send.
+
+### 8.2 Opaque values — passthrough
+
+`reserve`'s `hash`, the `url` it returns, and `outherProcessId` are server-issued
+values. The SDK passes them through verbatim: it never decodes, re-encodes,
+shortens or follows them. The clinic/API encryption keys are never embedded in
+the SDK.
 
 ---
 
@@ -689,13 +576,13 @@ are never embedded in the SDK.
 2. **Minimal dependencies** — prefer the platform HTTP client; pin the documented
    stack per language (see §7 / PLAN.md).
 3. **Typed** — public API and `data` payloads typed where the language supports it.
-4. **Auto-refresh + retry** per §5.4, concurrency-safe.
+4. **Fail fast on a missing token** — raise before dispatching (§5.2).
 5. **Pluggable** token store and HTTP client.
 6. **Errors** per §4 with full context.
-7. **Tested** — unit tests for envelope/error/refresh logic + at least one live
-   smoke path against `test` env (Faz 1–2).
-8. **Examples** — `examples/` with the end-to-end flow: login → search → slot →
-   reserve → (pay) and a measures example.
+7. **Tested** — unit tests for envelope/error/auth/config logic + at least one live
+   smoke path against `test`.
+8. **Examples** — `examples/` with the end-to-end partner flow: check doctor →
+   slots → reserve → create, and a measures read/write example.
 9. **Self-contained repo** — README, LICENSE (MIT), DESIGN.md copy, CI.
 10. **Versioning** — semver; tag `vX.Y.Z` per repo.
 
@@ -703,22 +590,15 @@ are never embedded in the SDK.
 
 ## 10. Live validation reference (test env)
 
-- Base: `https://apitest.bulutklinik.com/api/v3`
-- OAuth client: `Patients_Web_Mobile` — id `96b630b3-f62a-4e67-b33c-b58802dca5af` (secret in the collection / env file).
-- Test patient: `hackathon@bulutklinik.test` (`loginMode: email`).
-- Bookable `doctorId` examples: `8282` (interview + physical), `168896` (interview).
-- Known env limits (request is correct, server/env is the cause):
-  - `quickSearch` returns HTTP 404 / `resultType 1` on `test` — the search driver
-    (Elasticsearch) is unavailable there; the controller catches only
-    `QueryException` so other exceptions surface as a generic 404. `filteredSearch`
-    (`doctors.search`) works and is the production search path.
-  - `interviewPayment` may 404 if POS isn't configured for the company; 3DS capture
-    can't run from a non-browser client. SDK validation asserts the request shape +
-    `payment3DUrl` return, not the bank capture.
-- TS reference live result (2026-06-17, `test`): 8/9 steps OK — `auth.connect`,
-  `doctors.branches` (136), `doctors.locations` (81), `doctors.search`,
-  `doctors.detail`, `slots.schedule`, `measures.last`, `auth.disconnect` all pass;
-  only `quickSearch` fails for the env reason above.
+- Base: `https://apitest.bulutklinik.com/api/v3` (or `/v4`).
+- Auth: a partner token issued for a test company with the `apiouther` scope.
+  Unlike the patient surface there is no shared test credential in the Postman
+  collection — the token is per-integration.
+- Smoke path that needs no patient data: `doctors.branches` → `doctors.locations`
+  → `laboratory.catalog`. All three are `GET`, scope-gated only, and prove the
+  token and base URL are right.
+- Patient-scoped reads need a patient that exists **in the token's company**;
+  a TCKN that works on the patient surface will not necessarily resolve here.
 
 ---
 
@@ -731,3 +611,43 @@ This file is canonical. When it changes:
 
 If an SDK must diverge from this spec, fix the spec first (or record the
 divergence here) — code and SSOT must never silently disagree.
+
+---
+
+## 12. Migration from 0.6.x
+
+0.6.x shipped two personas: a patient surface at the client root and a partner
+surface under `client.partner.*`. 1.0.0 keeps **only** the partner one and lifts
+it to the root.
+
+### 12.1 Mechanical rename
+
+| 0.6.x | 1.0.0 |
+|-------|-------|
+| `client.partner.doctors.*` | `client.doctors.*` |
+| `client.partner.slots.*` | `client.slots.*` |
+| `client.partner.appointments.*` | `client.appointments.*` |
+| `client.partner.measures.*` | `client.measures.*` |
+| `client.partner.laboratory.*` | `client.laboratory.*` |
+| `client.partner.diets.*` | `client.diets.*` |
+
+Behaviour, paths and payloads of these 28 methods are unchanged.
+
+### 12.2 Removed with no replacement
+
+`auth` (all 11 methods) · `payments` (5) · `skin` · `meals` · `addresses` (4) ·
+and the patient-persona `doctors`/`slots`/`appointments`/`measures`/`laboratory`/`diets`
+that lived at the root in 0.6.x. §1.2 explains why each has no partner
+equivalent. An application that needs a patient session must talk to the API
+directly; the SDK no longer models it.
+
+### 12.3 Configuration
+
+| 0.6.x | 1.0.0 |
+|-------|-------|
+| `clientId`, `clientSecret` | removed |
+| `partnerToken` (optional, for 2 endpoints) | **required** credential for the whole client |
+| token store held `accessToken` + `refreshToken` | holds one partner token |
+| silent refresh + retry on 401/`resultType 4` | removed — `AuthenticationError`, no retry (§5.3) |
+| base URL fixed at `/api/v3` | `/api/v3` or `/api/v4` via `apiVersion` |
+| escape hatch `auth` default `bearer` | default `partner`; `bearer` no longer exists |

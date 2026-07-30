@@ -1,4 +1,9 @@
-// Bulutklinik API SDK for C++ (C++17). Public API.
+// Bulutklinik partner API SDK for C++ (C++17). Public API.
+//
+// Single-persona SDK: every call runs on the company-scoped `/outher` surface
+// with the partner token issued for your integration. You act on the patients of
+// your own company, and the patient is named inline on each request — there is
+// no login and no session.
 #ifndef BULUTKLINIK_BULUTKLINIK_HPP
 #define BULUTKLINIK_BULUTKLINIK_HPP
 
@@ -17,9 +22,14 @@ namespace bulutklinik {
 /// Base URL presets.
 enum class Environment { Production, Test, Local };
 
-/// Authorization mode for a request. `Bearer` uses the stored access token,
-/// `Partner` the configured partner token, `Public` sends no `Authorization`.
-enum class Auth { Public, Bearer, Partner };
+/// API version segment. The `/outher` surface is route-for-route identical on
+/// both, so switching is configuration rather than a code change.
+enum class ApiVersion { V3, V4 };
+
+/// Authorization mode for a request. `Partner` sends the configured partner
+/// token; `Public` sends no `Authorization` header. Every typed method is
+/// `Partner` — `Public` is only reachable through `Client::request`.
+enum class Auth { Public, Partner };
 
 // ---------------- errors ----------------
 
@@ -36,6 +46,11 @@ public:
 };
 
 /// An HTTP response was received but the call was not successful.
+///
+/// Note that `/outher` reports most business-rule failures as HTTP 501 with
+/// `result_type` 1 — "patient not found in your company", "slot no longer free",
+/// "doctor not bookable through your integration". It is not a server crash;
+/// read the message.
 class ApiError : public BulutklinikError {
 public:
     ApiError(const std::string& message, int http_status, std::optional<int> result_type,
@@ -64,10 +79,15 @@ class ValidationError : public ApiError {
 public:
     using ApiError::ApiError;
 };
+/// 401, a revoked token (result_type 2), or an expired one (result_type 4).
 class AuthenticationError : public ApiError {
 public:
     using ApiError::ApiError;
 };
+/// 403 — the token authenticated but is not permitted. Either it lacks the
+/// `apiouther` scope or it resolves to a user with no company. The company
+/// boundary comes from the token, never from request input, so retrying with
+/// different body parameters will not help.
 class AuthorizationError : public ApiError {
 public:
     using ApiError::ApiError;
@@ -83,13 +103,19 @@ public:
 
 // ---------------- token store ----------------
 
-/// Pluggable token persistence. The default is in-memory.
+/// Pluggable source for the partner token.
+///
+/// The token is read on every request, so pointing this at a file, cache,
+/// database or secret manager lets a long-running process pick up a newly issued
+/// token without being rebuilt. An empty optional means "no token"; the transport
+/// then fails before dispatching rather than sending an anonymous request.
+///
+/// Implementations must be thread-safe.
 class TokenStore {
 public:
     virtual ~TokenStore() = default;
-    virtual std::optional<std::string> access_token() const = 0;
-    virtual std::optional<std::string> refresh_token() const = 0;
-    virtual void set_tokens(const std::string& access, const std::optional<std::string>& refresh) = 0;
+    virtual std::optional<std::string> token() const = 0;
+    virtual void set_token(const std::optional<std::string>& token) = 0;
     virtual void clear() = 0;
 };
 
@@ -97,32 +123,24 @@ public:
 class InMemoryTokenStore : public TokenStore {
 public:
     InMemoryTokenStore() = default;
-    InMemoryTokenStore(std::optional<std::string> access, std::optional<std::string> refresh)
-        : access_(std::move(access)), refresh_(std::move(refresh)) {}
+    explicit InMemoryTokenStore(std::optional<std::string> token) : token_(std::move(token)) {}
 
-    std::optional<std::string> access_token() const override {
+    std::optional<std::string> token() const override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return access_;
+        return token_;
     }
-    std::optional<std::string> refresh_token() const override {
+    void set_token(const std::optional<std::string>& token) override {
         std::lock_guard<std::mutex> lock(mutex_);
-        return refresh_;
-    }
-    void set_tokens(const std::string& access, const std::optional<std::string>& refresh) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        access_ = access;
-        refresh_ = refresh;
+        token_ = token;
     }
     void clear() override {
         std::lock_guard<std::mutex> lock(mutex_);
-        access_.reset();
-        refresh_.reset();
+        token_.reset();
     }
 
 private:
     mutable std::mutex mutex_;
-    std::optional<std::string> access_;
-    std::optional<std::string> refresh_;
+    std::optional<std::string> token_;
 };
 
 // ---------------- HTTP backend ----------------
@@ -158,178 +176,23 @@ public:
     HttpResponse send(const HttpRequest& request) override;
 };
 
-// ---------------- models ----------------
+// ---------------- configuration ----------------
 
-struct LoginResult {
-    bool two_factor_required = false;
-    std::optional<std::string> two_factor_response;
-};
-
-struct CardInfo {
-    std::string card_holder;
-    std::string card_number;
-    std::string card_exp_month;
-    std::string card_exp_year;
-    std::string card_cvv;
-};
-
-struct RegisterInput {
-    std::string name;
-    std::string surname;
-    std::string api_user_name;
-    std::string phone_number;
-    std::string password;
-    std::string sms_verification_code;
-    std::string response;
-    int accept_user_agreement = 1;
-    std::optional<std::string> client_id;
-    std::optional<std::string> client_secret;
-};
-
-/// Input for the registration verify step (AuthResource::verify_registration).
-/// The endpoint requires a CAPTCHA token (recaptcha_v2 or captcha) minted by a
-/// browser/human, and is authorized with the configured partner token.
-struct VerifyRegistrationInput {
-    std::string name;
-    std::string surname;
-    std::string phone_number;
-    /// Country dial code only, e.g. "+90" (matches ^\+\d{1,3}$).
-    std::string phone_code;
-    std::string email;
-    std::string password;
-    int accept_user_agreement = 1;
-    /// Sent as "g-recaptcha-response-v2". Provide this or captcha.
-    std::optional<std::string> recaptcha_v2;
-    /// Sent as "captcha". Provide this or recaptcha_v2.
-    std::optional<std::string> captcha;
-    /// Optional structured agreement approvals, passed through verbatim.
-    std::optional<nlohmann::json> user_agreements;
-};
-
-/// Step 2 of the e-mail-branch registration (AuthResource::confirm_registration_email).
-struct ConfirmRegistrationEmailInput {
-    std::string verification_code;
-    /// The blob from verify_registration (when confirmationType was "email").
-    std::string response;
-    std::optional<nlohmann::json> user_agreements;
-};
-
-/// Step 1 of social sign-up (public; no CAPTCHA and no partner token).
-struct VerifyRegistrationSocialInput {
-    std::string name;
-    std::string surname;
-    std::string phone_number;
-    std::string password;
-    /// Social provider identifier (e.g. "google", "apple").
-    std::string social_type;
-    /// The social provider key/token identifying the user.
-    std::string key;
-    std::optional<std::string> email;
-    int accept_user_agreement = 1;
-    std::optional<nlohmann::json> user_agreements;
-};
-
-/// Step 2 of social sign-up. Does NOT mint tokens; log in via connect (social) after.
-struct RegisterSocialInput {
-    std::string sms_verification_code;
-    /// The blob from verify_registration_social.
-    std::string response;
-    std::optional<nlohmann::json> user_agreements;
-};
-
-/// Step 1 of password reset (AuthResource::forgot_password).
-struct ForgotPasswordInput {
-    std::string phone_number;
-    /// Optional "YYYY-MM-DD"; required by installs that verify identity.
-    std::optional<std::string> birthdate;
-    /// Sent as "g-recaptcha-response-v2". Set this or captcha (required outside local env).
-    std::optional<std::string> recaptcha_v2;
-    std::optional<std::string> captcha;
-};
-
-/// Step 2 of password reset (AuthResource::reset_password).
-struct ResetPasswordInput {
-    std::string sms_confirm_code;
-    /// The blob from forgot_password.
-    std::string response;
-    std::string password;
-};
-
-/// A new patient address (AddressesResource::add). city_id/district_id are numeric
-/// ids sent as strings; city_id comes from doctors().locations(), district_id from
-/// GET /getConfig (cities[].districts[]).
-struct AddressInput {
-    std::string title;
-    std::optional<std::string> description;
-    std::string city_id;
-    std::string district_id;
-    std::string address;
-    std::string location_lat;
-    std::string location_lng;
-    /// 1 makes it the default (the first address is default anyway).
-    std::optional<int> is_default;
-};
-
-/// An address update by id (AddressesResource::update). Unset optionals are omitted.
-struct AddressUpdateInput {
-    std::string id;
-    std::optional<std::string> title;
-    std::optional<std::string> description;
-    std::optional<std::string> city_id;
-    std::optional<std::string> district_id;
-    std::optional<std::string> address;
-    std::optional<std::string> location_lat;
-    std::optional<std::string> location_lng;
-    std::optional<int> is_default;
-};
-
-struct SearchInput {
-    nlohmann::json search_params = nlohmann::json::object();
-    std::vector<std::string> order_params;
-    std::vector<std::string> other_params;
-    int current_page = 1;
-    int per_page_limit = 20;
-};
-
-struct PaymentInput {
-    std::string doctor_id;
-    std::string appointment_date;
-    bool is_3d = false;
-    bool terms_accept = false;
-    std::string appointment_type = "interview";
-    std::optional<CardInfo> card_info;
-    std::optional<std::string> card_id;
-    int save_card = 0;
-    std::string discount_code;
-    std::optional<std::string> case_detail;
-};
-
-/// Input for `meals().analyze`. `image` is base64 (a `data:…;base64,` prefix is
-/// accepted). `portion_size` is one of `small | medium | large | custom` and
-/// `meal_type` one of `breakfast | lunch | dinner | snack`. `portion_grams` is
-/// required when `portion_size == "custom"`. `note` is optional free text.
-struct MealInput {
-    std::string image;
-    std::string portion_size;
-    std::string meal_type;
-    std::optional<int> portion_grams;
-    std::optional<std::string> note;
-};
-
-/// Input for `laboratory().order`. All three ids are required and map to the
-/// API body `{ testId, addressId, laboratoryId }`.
-struct LabOrderInput {
-    std::string test_id;
-    std::string address_id;
-    std::string laboratory_id;
-};
-
+/// Client configuration.
+///
+/// Set `partner_token` **or** `token_store`, not both — either the literal or the
+/// store is the source of truth for the credential, and guessing which one the
+/// caller meant is how credential bugs get shipped. Passing both throws
+/// std::invalid_argument from the Client constructor.
 struct ClientOptions {
     Environment environment = Environment::Production;
+    /// Ignored when `base_url` is set.
+    ApiVersion api_version = ApiVersion::V3;
+    /// Explicit base URL; overrides `environment` + `api_version`.
     std::optional<std::string> base_url;
     std::string lang = "tr";
-    std::optional<std::string> client_id;
-    std::optional<std::string> client_secret;
+    /// The partner token issued for your integration. Seeds the default
+    /// in-memory token store.
     std::optional<std::string> partner_token;
     std::shared_ptr<TokenStore> token_store;
     std::shared_ptr<HttpBackend> http_backend;
@@ -340,7 +203,7 @@ struct ClientOptions {
 /// `nlohmann::json` (a null value means "no body"); a per-request `lang`
 /// overrides the client default when set.
 struct RequestOptions {
-    Auth auth = Auth::Bearer;
+    Auth auth = Auth::Partner;
     nlohmann::json body = nlohmann::json(nullptr);
     std::optional<std::string> lang;
 };
@@ -349,231 +212,16 @@ namespace detail {
 class Transport;
 }
 
-// ---------------- resources ----------------
+// ---------------- patient references ----------------
 
-class AuthResource {
-public:
-    explicit AuthResource(detail::Transport* transport) : t_(transport) {}
-
-    LoginResult connect(const std::string& api_user_name,
-                        const std::optional<std::string>& api_user_password,
-                        const std::string& login_mode,
-                        const std::optional<std::string>& client_id = std::nullopt,
-                        const std::optional<std::string>& client_secret = std::nullopt,
-                        const std::optional<std::string>& with_phone_number = std::nullopt);
-    void connect_with_two_factor(const std::string& sms_verification_code, const std::string& response);
-    /// Registration step 1: send the verification code and return the raw data
-    /// holding the encrypted `response` blob. Uses the configured partner token
-    /// (the endpoint is behind `auth:apiusers`, not public); a CAPTCHA token
-    /// (recaptcha_v2 or captcha), minted by a browser/human, is required. Feed the
-    /// returned `response` (and the code the user receives) into register_patient.
-    nlohmann::json verify_registration(const VerifyRegistrationInput& input);
-    /// Named register_patient because `register` is a reserved keyword in C++.
-    void register_patient(const RegisterInput& input);
-    /// Step 2 of e-mail-branch registration: confirm the e-mailed code and get the
-    /// SMS blob (confirmationType "sms") to feed into register_patient. Public.
-    nlohmann::json confirm_registration_email(const ConfirmRegistrationEmailInput& input);
-    /// Step 1 of social sign-up: send the SMS code, return the raw data holding the
-    /// response blob. Public (no CAPTCHA/partner token). Feeds register_social.
-    nlohmann::json verify_registration_social(const VerifyRegistrationSocialInput& input);
-    /// Step 2 of social sign-up: create the social patient. Does NOT log in — call
-    /// connect with login_mode "social" afterwards. Public.
-    void register_social(const RegisterSocialInput& input);
-    /// Step 1 of password reset: send the SMS confirm code, return the raw data
-    /// holding the response blob. A CAPTCHA token is required outside local env. Public.
-    nlohmann::json forgot_password(const ForgotPasswordInput& input);
-    /// Step 2 of password reset: set the new password with the SMS confirm code + blob. Public.
-    void reset_password(const ResetPasswordInput& input);
-    void refresh();
-    void disconnect();
-
-private:
-    detail::Transport* t_;
-};
-
-class DoctorsResource {
-public:
-    explicit DoctorsResource(detail::Transport* transport) : t_(transport) {}
-
-    nlohmann::json branches();
-    nlohmann::json locations();
-    nlohmann::json quick_search(const std::string& search_text,
-                               const std::optional<std::string>& list_type = std::nullopt,
-                               const std::optional<std::string>& location = std::nullopt);
-    nlohmann::json search(const SearchInput& input);
-    nlohmann::json detail(const std::string& id, const std::optional<std::string>& corporate = std::nullopt);
-
-private:
-    detail::Transport* t_;
-};
-
-class SlotsResource {
-public:
-    explicit SlotsResource(detail::Transport* transport) : t_(transport) {}
-
-    nlohmann::json schedule(const std::string& doctor_id, const std::string& list_type,
-                           const std::optional<std::string>& schedule_date = std::nullopt,
-                           int schedule_step = 7, int schedule_page = 1);
-
-private:
-    detail::Transport* t_;
-};
-
-class AppointmentsResource {
-public:
-    explicit AppointmentsResource(detail::Transport* transport) : t_(transport) {}
-
-    nlohmann::json reserve_interview(const std::string& doctor_id, const std::string& appointment_date,
-                                    const std::string& appointment_type = "interview");
-    nlohmann::json add_physical(const std::string& doctor_id, const std::string& appointment_date);
-    nlohmann::json cancel(const std::string& event_id);
-    /// The patient's appointments ({foundAppointmentsCount, foundAppointments}). Each
-    /// item's event_id feeds cancel; rows with event_id "0" are paid-order/refund
-    /// entries (not cancellable). Server paging is disabled — omit page for the full list.
-    nlohmann::json list(std::optional<std::string> page = std::nullopt);
-    /// The patient's active online-slot reservation holds (with a minute_diff countdown).
-    nlohmann::json reservations();
-
-private:
-    detail::Transport* t_;
-};
-
-/// The patient's saved addresses. Required by laboratory().order() (needs an
-/// addressId). add/update take a city_id (from doctors().locations()) and a
-/// district_id (from GET /getConfig — cities[].districts[]).
-class AddressesResource {
-public:
-    explicit AddressesResource(detail::Transport* transport) : t_(transport) {}
-
-    /// List saved addresses (default first). Each item's "id" is the addressId.
-    nlohmann::json list();
-    /// Add an address. Success data is {"addressId": ...}. The first address is default.
-    nlohmann::json add(const AddressInput& input);
-    /// Update an address by id. Send only id + is_default to flip the default flag.
-    nlohmann::json update(const AddressUpdateInput& input);
-    /// Delete an address by id (sent in the body). Named delete_address because
-    /// `delete` is a reserved keyword in C++. Default/used addresses cannot be deleted.
-    nlohmann::json delete_address(const std::string& id);
-
-private:
-    detail::Transport* t_;
-};
-
-class PaymentsResource {
-public:
-    explicit PaymentsResource(detail::Transport* transport) : t_(transport) {}
-
-    nlohmann::json check_discount_code(const std::string& check_type, const std::string& discount_code,
-                                      const std::optional<std::string>& doctor_id = std::nullopt,
-                                      const std::optional<std::string>& order_id = std::nullopt,
-                                      const std::optional<std::string>& special_service_id = std::nullopt,
-                                      const std::optional<std::string>& program_slug = std::nullopt);
-    nlohmann::json get_cards();
-    nlohmann::json save_card(const CardInfo& card);
-    nlohmann::json pay(const PaymentInput& input);
-    nlohmann::json delete_card(const std::string& card_id);
-
-private:
-    detail::Transport* t_;
-};
-
-class MeasuresResource {
-public:
-    explicit MeasuresResource(detail::Transport* transport) : t_(transport) {}
-
-    nlohmann::json add_list(const std::vector<nlohmann::json>& records);
-    nlohmann::json add(const std::string& measure_type, const nlohmann::json& fields);
-    nlohmann::json update(const std::string& measure_type, const nlohmann::json& fields);
-    /// Named delete_measure because `delete` is a reserved keyword in C++.
-    nlohmann::json delete_measure(const std::string& measure_type, const std::string& id);
-    nlohmann::json last();
-    nlohmann::json list(const std::string& measure_type, const std::string& page,
-                       std::optional<int> glucose_type = std::nullopt);
-    nlohmann::json graph(const std::string& measure_type, int period, const std::string& page,
-                        std::optional<int> glucose_type = std::nullopt);
-    nlohmann::json partner_health_information(const std::optional<std::string>& identity,
-                                             const std::optional<std::string>& phone_number,
-                                             const std::vector<nlohmann::json>& data);
-
-private:
-    detail::Transport* t_;
-};
-
-/// "Cildimde Neyim Var" — AI skin-lesion analysis.
-class SkinResource {
-public:
-    explicit SkinResource(detail::Transport* transport) : t_(transport) {}
-
-    /// Analyze one or more skin photos. Each image is a loose record like
-    /// `{"image": "<base64>", "branch_id": 42}` (`branch_id` optional). Returns
-    /// the `data` payload verbatim (per-image lesion label, Turkish comment,
-    /// confidence, possible ICD hints and an opaque `case_detail` blob).
-    nlohmann::json analyze(const std::vector<nlohmann::json>& images);
-
-private:
-    detail::Transport* t_;
-};
-
-/// AI meal-photo calorie/nutrition estimation (sibling of `skin`).
-class MealsResource {
-public:
-    explicit MealsResource(detail::Transport* transport) : t_(transport) {}
-
-    /// Estimate calories and nutrition from a meal photo. Input names map to the
-    /// API's snake_case body (`portion_size`, `portion_grams`, `meal_type`).
-    nlohmann::json analyze(const MealInput& input);
-
-private:
-    detail::Transport* t_;
-};
-
-/// The patient's laboratory results, the orderable test catalog, and pre-ordering.
-class LaboratoryResource {
-public:
-    explicit LaboratoryResource(detail::Transport* transport) : t_(transport) {}
-
-    /// The patient's completed/in-progress lab results. `page` defaults to 1
-    /// server-side when the segment is omitted.
-    nlohmann::json results(std::optional<std::string> page = std::nullopt);
-    /// One result's detail. `test_id` is a string (`"123"` or `"123-lab"`),
-    /// interpolated verbatim.
-    nlohmann::json result_detail(const std::string& test_id);
-    /// The orderable test-group catalog.
-    nlohmann::json catalog();
-    /// One catalog group by id.
-    nlohmann::json catalog_detail(const std::string& id);
-    /// Pre-order a lab test. All three ids are required.
-    nlohmann::json order(const LabOrderInput& input);
-
-private:
-    detail::Transport* t_;
-};
-
-/// The patient's diet lists (a dietitian's "Diyet Listesi"). JSON only.
-class DietsResource {
-public:
-    explicit DietsResource(detail::Transport* transport) : t_(transport) {}
-
-    /// The patient's diet lists. `page` defaults to 1 server-side when omitted.
-    nlohmann::json list(std::optional<std::string> page = std::nullopt);
-    /// One diet list's detail by `list_id`.
-    nlohmann::json detail(const std::string& list_id);
-
-private:
-    detail::Transport* t_;
-};
-
-// ---------------- client ----------------
-
-/// The Bulutklinik API client. Construct once and reuse; resources are obtained
-/// via accessor methods (e.g. client.doctors().quick_search(...)).
-// ---------------- partner surface (/outher — company-scoped) ----------------
-
-/// Identifies a patient on the partner surface.
+/// Identifies a patient.
 ///
 /// Reads need only `identity_number` (primary) or `phone_number` (accepted solely
 /// when it matches exactly one patient in your company — the column is not unique,
-/// and the server fails closed rather than guessing).
+/// and the server fails closed rather than guessing). The server looks only inside
+/// your own company on this path and never creates anything, so a patient you have
+/// never treated resolves to "not found" — with the same message as "not yours",
+/// so the endpoint cannot be used to probe for TCKNs.
 ///
 /// Writes need `name`, `surname` and `phone_number` as well: if no matching
 /// patient exists in your company the server creates one.
@@ -607,15 +255,20 @@ struct AppointmentLookup {
     nlohmann::json to_json() const;
 };
 
-/// Doctor discovery on the partner surface. Results are scoped to the doctors
-/// enabled for your integration, so a doctor returned here is one you can book.
-class PartnerDoctorsResource {
-public:
-    explicit PartnerDoctorsResource(detail::Transport* transport) : t_(transport) {}
+// ---------------- resources ----------------
 
+/// Doctor discovery. Results are scoped to the doctors enabled for your
+/// integration, so a doctor returned here is one you can book. `locations` is the
+/// exception — a global city catalogue, not company-scoped.
+class DoctorsResource {
+public:
+    explicit DoctorsResource(detail::Transport* transport) : t_(transport) {}
+
+    /// `order_params` accepts "name", "order" and "slot".
     nlohmann::json search(const nlohmann::json& search_params, int current_page = 1,
                           const std::vector<std::string>& order_params = {});
     nlohmann::json branches();
+    /// The `doctor_id` here feeds `SlotsResource::schedule`.
     nlohmann::json detail(const std::string& doctor_id);
     /// City list. Global catalogue — not scoped to your company.
     nlohmann::json locations();
@@ -624,13 +277,15 @@ private:
     detail::Transport* t_;
 };
 
-/// Doctor availability on the partner surface.
-class PartnerSlotsResource {
+/// Doctor availability.
+class SlotsResource {
 public:
-    explicit PartnerSlotsResource(detail::Transport* transport) : t_(transport) {}
+    explicit SlotsResource(detail::Transport* transport) : t_(transport) {}
 
     /// Either pass `schedule_date` (`Y-m-d`), or page with `schedule_step` +
     /// `schedule_page`; the server requires one of the two forms.
+    ///
+    /// Returns a date-keyed map; `slotId` feeds `AppointmentsResource::reserve`.
     nlohmann::json schedule(const std::string& doctor_id,
                             const std::optional<std::string>& schedule_date = std::nullopt,
                             std::optional<int> schedule_step = std::nullopt,
@@ -640,30 +295,48 @@ private:
     detail::Transport* t_;
 };
 
-/// Appointment lifecycle on the partner surface. The patient is supplied inline;
-/// the server materialises it inside your company on write.
+/// The appointment lifecycle. The patient is supplied inline as `user`; the
+/// server materialises it inside your company on write.
 ///
-/// Payment is not taken through the API: `reserve` returns a process settled
-/// through the hosted web checkout.
-class PartnerAppointmentsResource {
+/// Two booking flows:
+///   - hand off to the patient: `reserve` returns a `url` the patient opens in a
+///     browser to accept the agreements and pay;
+///   - you collected the agreements: `reserve_without_agreement` returns a `hash`
+///     to feed, with `outherProcessId`, into `create`.
+///
+/// Payment is never taken through the API. No partner endpoint produces a
+/// financial record; that is what the browser hand-off is for.
+class AppointmentsResource {
 public:
-    explicit PartnerAppointmentsResource(detail::Transport* transport) : t_(transport) {}
+    explicit AppointmentsResource(detail::Transport* transport) : t_(transport) {}
 
+    /// Hold an online slot and get back a `url` for the patient to complete
+    /// agreements and payment in a browser.
     nlohmann::json reserve(const std::string& slot_id, const std::string& doctor_id,
                            const Patient& user);
+    /// Same hold, for integrations that collect the agreements themselves.
+    /// Returns a `hash` plus `reservationExpired` — confirm before it passes.
     nlohmann::json reserve_without_agreement(const std::string& slot_id, const std::string& doctor_id,
                                              const Patient& user);
+    /// Instant reservation — no slot; the server picks an available doctor.
     nlohmann::json instant_reserve(const Patient& user);
     /// Turn a reservation into a confirmed appointment.
     nlohmann::json create(const std::string& hash, const std::string& outher_process_id);
+    /// Book a free-form time range outside the slot grid.
     nlohmann::json create_without_slot(const std::string& doctor_id, const std::string& start_date,
                                        const std::string& finish_date, const Patient& user,
                                        std::optional<int> is_outher_doctor = std::nullopt);
+    /// Cancel an appointment made with `create_without_slot` — and only those;
+    /// ones confirmed through `create` are not cancellable here.
     nlohmann::json cancel_without_slot(const AppointmentLookup& lookup);
+    /// The appointments you created for that phone number, not the patient's
+    /// history across the platform.
     nlohmann::json list(const std::string& phone_number,
                         const std::optional<std::string>& page = std::nullopt,
                         const std::optional<std::string>& type = std::nullopt);
     nlohmann::json info(const AppointmentLookup& lookup);
+    /// Whether a doctor is bookable through your integration. Fails with 501 when
+    /// they are not — call it before offering a doctor.
     nlohmann::json check_doctor(const std::string& doctor_id, int is_outher_doctor);
 
 private:
@@ -672,10 +345,11 @@ private:
 
 /// Diet lists recorded for a patient inside your own company. Lists written by
 /// other clinics are not visible here.
-class PartnerDietsResource {
+class DietsResource {
 public:
-    explicit PartnerDietsResource(detail::Transport* transport) : t_(transport) {}
+    explicit DietsResource(detail::Transport* transport) : t_(transport) {}
 
+    /// Page size is fixed to 20 server-side.
     nlohmann::json list(const Patient& patient,
                         const std::optional<std::string>& page = std::nullopt);
     /// `list_id` comes from `list`.
@@ -687,13 +361,15 @@ private:
 
 /// Laboratory catalogue (global, static) and results (your company only, merging
 /// the clinic's HBYS lab requests and TmcLab order groups).
-class PartnerLaboratoryResource {
+///
+/// Ordering a test is not available here — it creates a financial record.
+class LaboratoryResource {
 public:
-    explicit PartnerLaboratoryResource(detail::Transport* transport) : t_(transport) {}
+    explicit LaboratoryResource(detail::Transport* transport) : t_(transport) {}
 
     nlohmann::json catalog();
     /// Prices are the plain list prices — the patient-side discount pass does not
-    /// apply on the partner surface.
+    /// apply here.
     nlohmann::json catalog_detail(const std::string& test_id);
     /// Each item's `id` is accepted verbatim by `result_detail`; a `-lab` suffix
     /// marks a TmcLab order group.
@@ -705,16 +381,17 @@ private:
     detail::Transport* t_;
 };
 
-/// Health measurements on the partner surface.
+/// Health measurements.
 ///
 /// Scope: written into and read from your own company. Values the patient entered
-/// in the Bulutklinik mobile app live in the consumer tenant and are not visible
-/// here — a consequence of tenant isolation, not a bug.
-class PartnerMeasuresResource {
+/// in the Bulutklinik mobile app are not visible here, and a value you write does
+/// not appear in their app — a consequence of tenant isolation, not a bug.
+class MeasuresResource {
 public:
-    explicit PartnerMeasuresResource(detail::Transport* transport) : t_(transport) {}
+    explicit MeasuresResource(detail::Transport* transport) : t_(transport) {}
 
     nlohmann::json last(const Patient& patient);
+    /// `glucose_type` applies to "glucose" only (0=fasting, 1=postprandial).
     nlohmann::json list(const Patient& patient, const std::string& measure_type,
                         const std::optional<std::string>& page = std::nullopt,
                         std::optional<int> glucose_type = std::nullopt);
@@ -732,77 +409,60 @@ public:
     /// Named delete_measure because `delete` is a reserved keyword in C++.
     nlohmann::json delete_measure(const Patient& patient, const std::string& measure_type,
                                   const std::string& id);
+    /// Legacy bulk submission for `teusan` integrations.
+    ///
+    /// Deprecated: requires the `teusan` scope instead of `apiouther`, takes a flat
+    /// identity + phone number instead of a patient object, and writes into the
+    /// shared consumer tenant rather than your own company — so the values are not
+    /// readable through `last` or `list`. Prefer `add_list`.
+    [[deprecated("Requires the teusan scope and writes into the shared consumer tenant; prefer add_list.")]]
+    nlohmann::json health_information(const std::optional<std::string>& identity,
+                                      const std::optional<std::string>& phone_number,
+                                      const std::vector<nlohmann::json>& data);
 
 private:
     detail::Transport* t_;
 };
 
-/// The company-scoped partner surface (`/outher`), reachable as `client.partner()`.
-///
-/// A second persona, not a replacement for the patient one: requests use the
-/// configured `partner_token`, data is limited to your own company, and the
-/// patient is named inline on each call. The silent access-token refresh does not
-/// apply here.
-///
-/// Patient login/registration, the card vault, 3-D Secure payment, self-service AI
-/// and address CRUD have no partner equivalent and stay on the patient surface by
-/// design.
-class PartnerNamespace {
-public:
-    explicit PartnerNamespace(detail::Transport* transport) : t_(transport) {}
+// ---------------- client ----------------
 
-    PartnerDoctorsResource doctors() { return PartnerDoctorsResource(t_); }
-    PartnerSlotsResource slots() { return PartnerSlotsResource(t_); }
-    PartnerAppointmentsResource appointments() { return PartnerAppointmentsResource(t_); }
-    PartnerDietsResource diets() { return PartnerDietsResource(t_); }
-    PartnerLaboratoryResource laboratory() { return PartnerLaboratoryResource(t_); }
-    PartnerMeasuresResource measures() { return PartnerMeasuresResource(t_); }
-
-private:
-    detail::Transport* t_;
-};
-
+/// The Bulutklinik partner API client. Construct once and reuse; resources are
+/// obtained via accessor methods (e.g. client.doctors().branches()).
 class Client {
 public:
+    /// @throws std::invalid_argument when both `partner_token` and `token_store`
+    /// are set.
     explicit Client(ClientOptions options = {});
     ~Client();
 
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
-    AuthResource auth();
     DoctorsResource doctors();
     SlotsResource slots();
     AppointmentsResource appointments();
-    PaymentsResource payments();
     MeasuresResource measures();
-    SkinResource skin();
-    MealsResource meals();
     LaboratoryResource laboratory();
     DietsResource diets();
-    AddressesResource addresses();
-
-    /// The company-scoped partner surface (`/outher`). Uses the configured
-    /// `partner_token` instead of a patient login; data is limited to your own
-    /// company and the patient is named inline on each call.
-    PartnerNamespace partner();
 
     /// Escape hatch: call any Bulutklinik API endpoint that does not yet have a
     /// typed resource method. The request still goes through the shared transport,
-    /// so default headers, the chosen `auth` mode (`Auth::Bearer` by default),
-    /// silent token refresh + retry, envelope unwrapping and the typed error
-    /// hierarchy all apply. Returns the unwrapped `data` payload. Prefer a typed
-    /// resource method when one exists; reach for this only for the gaps.
+    /// so default headers, the chosen `auth` mode (`Auth::Partner` by default),
+    /// envelope unwrapping and the typed error hierarchy all apply. Returns the
+    /// unwrapped `data` payload. Prefer a typed resource method when one exists.
     ///
     /// @example
     /// ```cpp
-    /// auto branches = client.request("GET", "/patients/allBranches");
-    /// auto created = client.request("POST", "/patients/someNewEndpoint",
-    ///                               {bulutklinik::Auth::Bearer, {{"foo", "bar"}}});
+    /// auto branches = client.request("GET", "/outher/branches");
+    /// // Auth::Public reaches unauthenticated endpoints outside the partner surface
+    /// auto config = client.request("GET", "/general/getConfig",
+    ///                              {bulutklinik::Auth::Public});
     /// ```
     nlohmann::json request(const std::string& method, const std::string& path,
                            const RequestOptions& options = {});
 
+    /// The active token store. Write a newly issued partner token here to rotate
+    /// the credential without rebuilding the client.
     TokenStore& token_store();
 
 private:

@@ -1,6 +1,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -30,50 +31,123 @@ HttpResponse json_resp(int status, const std::string& body) {
     return r;
 }
 
-ClientOptions base_options(const std::shared_ptr<MockBackend>& backend, std::shared_ptr<TokenStore> store) {
+/// Options pointing at the mock backend. Unless a store is supplied, the
+/// credential is the partner token "PT".
+ClientOptions base_options(const std::shared_ptr<MockBackend>& backend,
+                           std::shared_ptr<TokenStore> store = nullptr) {
     ClientOptions o;
     o.base_url = "http://localhost";
     o.http_backend = backend;
-    o.token_store = std::move(store);
+    if (store) {
+        o.token_store = std::move(store);
+    } else {
+        o.partner_token = "PT";
+    }
     return o;
 }
 
-}  // namespace
-
-TEST_CASE("unwraps data and sends headers") {
-    auto backend = std::make_shared<MockBackend>();
-    backend->responder = [](const HttpRequest&) {
-        return json_resp(200, R"({"resultType":0,"data":{"searchedDoctors":[]}})");
-    };
-    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("abc"), std::nullopt)));
-
-    auto data = client.doctors().quick_search("kardiyo");
-
-    REQUIRE(data["searchedDoctors"].is_array());
-    REQUIRE(backend->requests.at(0).url == "http://localhost/patients/quickSearch");
-    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer abc");
-    REQUIRE(backend->requests.at(0).headers.at("lang") == "tr");
-}
-
-TEST_CASE("request escape hatch issues a bearer GET to the right URL") {
+std::shared_ptr<MockBackend> ok_backend() {
     auto backend = std::make_shared<MockBackend>();
     backend->responder = [](const HttpRequest&) {
         return json_resp(200, R"({"resultType":0,"data":{"ok":true}})");
     };
-    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("abc"), std::nullopt)));
+    return backend;
+}
 
-    auto data = client.request("GET", "/patients/customEndpoint");
+Patient reference_patient() {
+    Patient p;
+    p.identity_number = "12345678901";
+    return p;
+}
+
+}  // namespace
+
+TEST_CASE("unwraps data and sends the partner token and lang header") {
+    auto backend = std::make_shared<MockBackend>();
+    backend->responder = [](const HttpRequest&) {
+        return json_resp(200, R"({"resultType":0,"data":{"foundDoctors":[]}})");
+    };
+    Client client(base_options(backend));
+
+    auto data = client.doctors().search(nlohmann::json{{"withFreeText", "kardiyoloji"}}, 1, {"slot"});
+
+    REQUIRE(data["foundDoctors"].is_array());
+    REQUIRE(backend->requests.at(0).url == "http://localhost/outher/search");
+    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer PT");
+    REQUIRE(backend->requests.at(0).headers.at("lang") == "tr");
+}
+
+TEST_CASE("api version selects the base URL without changing any path") {
+    for (const auto& pair : std::vector<std::pair<ApiVersion, std::string>>{
+             {ApiVersion::V3, "https://apitest.bulutklinik.com/api/v3/outher/branches"},
+             {ApiVersion::V4, "https://apitest.bulutklinik.com/api/v4/outher/branches"},
+         }) {
+        auto backend = ok_backend();
+        ClientOptions o;
+        o.environment = Environment::Test;
+        o.api_version = pair.first;
+        o.partner_token = "PT";
+        o.http_backend = backend;
+        Client client(o);
+
+        client.doctors().branches();
+
+        REQUIRE(backend->requests.at(0).url == pair.second);
+    }
+}
+
+TEST_CASE("partner_token and token_store together is rejected") {
+    ClientOptions o;
+    o.partner_token = "PT";
+    o.token_store = std::make_shared<InMemoryTokenStore>(std::string("OTHER"));
+
+    REQUIRE_THROWS_AS(Client(o), std::invalid_argument);
+}
+
+TEST_CASE("partner_token seeds the default store") {
+    auto backend = ok_backend();
+    Client client(base_options(backend));
+
+    REQUIRE(client.token_store().token().value() == "PT");
+}
+
+TEST_CASE("a missing token fails before dispatch") {
+    auto backend = ok_backend();
+    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>()));
+
+    REQUIRE_THROWS_AS(client.doctors().branches(), AuthenticationError);
+    REQUIRE(backend->requests.empty());
+}
+
+TEST_CASE("the token is read from the store on every call") {
+    auto backend = ok_backend();
+    auto store = std::make_shared<InMemoryTokenStore>(std::string("first"));
+    Client client(base_options(backend, store));
+
+    client.doctors().branches();
+    store->set_token(std::string("second"));
+    client.doctors().branches();
+
+    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer first");
+    REQUIRE(backend->requests.at(1).headers.at("Authorization") == "Bearer second");
+}
+
+TEST_CASE("request escape hatch defaults to the partner token") {
+    auto backend = ok_backend();
+    Client client(base_options(backend));
+
+    auto data = client.request("GET", "/outher/customEndpoint");
 
     REQUIRE(data["ok"].get<bool>());
-    REQUIRE(backend->requests.at(0).url == "http://localhost/patients/customEndpoint");
+    REQUIRE(backend->requests.at(0).url == "http://localhost/outher/customEndpoint");
     REQUIRE(backend->requests.at(0).method == "GET");
-    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer abc");
+    REQUIRE(backend->requests.at(0).headers.at("Authorization") == "Bearer PT");
 }
 
 TEST_CASE("request escape hatch sends a public POST body and omits Authorization") {
     auto backend = std::make_shared<MockBackend>();
     backend->responder = [](const HttpRequest&) { return json_resp(200, R"({"resultType":0,"data":{"id":7}})"); };
-    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("abc"), std::nullopt)));
+    Client client(base_options(backend));
 
     RequestOptions options;
     options.auth = Auth::Public;
@@ -92,9 +166,17 @@ TEST_CASE("maps 422 to ValidationError") {
     backend->responder = [](const HttpRequest&) {
         return json_resp(422, R"({"resultType":1,"errorType":"validation"})");
     };
-    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("a"), std::nullopt)));
+    Client client(base_options(backend));
 
     REQUIRE_THROWS_AS(client.doctors().branches(), ValidationError);
+}
+
+TEST_CASE("maps 403 to AuthorizationError") {
+    auto backend = std::make_shared<MockBackend>();
+    backend->responder = [](const HttpRequest&) { return json_resp(403, R"({"resultType":1})"); };
+    Client client(base_options(backend));
+
+    REQUIRE_THROWS_AS(client.doctors().branches(), AuthorizationError);
 }
 
 TEST_CASE("maps numeric 404 to NotFoundError") {
@@ -102,35 +184,24 @@ TEST_CASE("maps numeric 404 to NotFoundError") {
     backend->responder = [](const HttpRequest&) {
         return json_resp(404, R"({"resultType":1,"errorType":1,"errorMessage":"Bilinmeyen"})");
     };
-    Client client(base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("a"), std::nullopt)));
+    Client client(base_options(backend));
 
-    REQUIRE_THROWS_AS(client.doctors().quick_search("x"), NotFoundError);
+    REQUIRE_THROWS_AS(client.doctors().branches(), NotFoundError);
 }
 
-TEST_CASE("refreshes once then retries with the new token") {
+TEST_CASE("an expired token is surfaced without retrying") {
     auto backend = std::make_shared<MockBackend>();
-    int data_calls = 0;
-    backend->responder = [&data_calls](const HttpRequest& req) {
-        if (req.url.find("/general/refreshApi") != std::string::npos) {
-            return json_resp(200, R"({"resultType":0,"data":{"access_token":"new","refresh_token":"r2"}})");
-        }
-        ++data_calls;
-        if (data_calls == 1) {
-            return json_resp(401, R"({"resultType":4})");
-        }
-        return json_resp(200, R"({"resultType":0,"data":{"ok":true}})");
+    backend->responder = [](const HttpRequest&) {
+        return json_resp(401, R"({"resultType":4,"errorMessage":"You must log in."})");
     };
-    auto store = std::make_shared<InMemoryTokenStore>(std::string("old"), std::string("r"));
-    ClientOptions o = base_options(backend, store);
-    o.client_id = "c";
-    o.client_secret = "s";
-    Client client(o);
+    auto store = std::make_shared<InMemoryTokenStore>(std::string("expired"));
+    Client client(base_options(backend, store));
 
-    auto data = client.measures().last();
-
-    REQUIRE(data["ok"].get<bool>());
-    REQUIRE(store->access_token().value() == "new");
-    REQUIRE(backend->requests.back().headers.at("Authorization") == "Bearer new");
+    REQUIRE_THROWS_AS(client.measures().last(reference_patient()), AuthenticationError);
+    REQUIRE(backend->requests.size() == 1);
+    // An expired token is kept: the caller may want to inspect it while
+    // installing the replacement. Only a revoked one is cleared.
+    REQUIRE(store->token().value() == "expired");
 }
 
 TEST_CASE("logout clears the store") {
@@ -138,44 +209,22 @@ TEST_CASE("logout clears the store") {
     backend->responder = [](const HttpRequest&) {
         return json_resp(200, R"({"resultType":2,"errorMessage":"logged out"})");
     };
-    auto store = std::make_shared<InMemoryTokenStore>(std::string("a"), std::string("r"));
+    auto store = std::make_shared<InMemoryTokenStore>(std::string("revoked"));
     Client client(base_options(backend, store));
 
-    REQUIRE_THROWS_AS(client.measures().last(), AuthenticationError);
-    REQUIRE_FALSE(store->access_token().has_value());
+    REQUIRE_THROWS_AS(client.measures().last(reference_patient()), AuthenticationError);
+    REQUIRE_FALSE(store->token().has_value());
 }
 
-TEST_CASE("connect stores tokens and fills credentials") {
+TEST_CASE("transport failures become TransportError") {
     auto backend = std::make_shared<MockBackend>();
     backend->responder = [](const HttpRequest&) {
-        return json_resp(200, R"({"resultType":0,"data":{"access_token":"t","refresh_token":"r"}})");
+        HttpResponse r;
+        r.transport_error = true;
+        r.error_message = "boom";
+        return r;
     };
-    auto store = std::make_shared<InMemoryTokenStore>();
-    ClientOptions o = base_options(backend, store);
-    o.client_id = "c";
-    o.client_secret = "s";
-    Client client(o);
+    Client client(base_options(backend));
 
-    auto result = client.auth().connect("u", std::string("p"), "email");
-
-    REQUIRE_FALSE(result.two_factor_required);
-    REQUIRE(store->access_token().value() == "t");
-    auto body = nlohmann::json::parse(backend->requests.at(0).body.value());
-    REQUIRE(body["apiClientId"] == "c");
-    REQUIRE(body["loginMode"] == "email");
-}
-
-TEST_CASE("uses the partner token") {
-    auto backend = std::make_shared<MockBackend>();
-    backend->responder = [](const HttpRequest&) { return json_resp(200, R"({"resultType":0,"data":null})"); };
-    ClientOptions o = base_options(backend, std::make_shared<InMemoryTokenStore>(std::string("a"), std::nullopt));
-    o.partner_token = "PT";
-    Client client(o);
-
-    std::vector<nlohmann::json> data = {
-        {{"type", "pulse"}, {"date_time", "2026-06-17 09:00"}, {"pulse", 72}},
-    };
-    client.measures().partner_health_information(std::nullopt, std::string("5551112233"), data);
-
-    REQUIRE(backend->requests.back().headers.at("Authorization") == "Bearer PT");
+    REQUIRE_THROWS_AS(client.doctors().branches(), TransportError);
 }
