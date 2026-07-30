@@ -4,6 +4,23 @@ All notable changes to the Bulutklinik C++ SDK are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1]
+
+Documentation and contract corrections found by auditing the SDKs against the
+API source before release. No wire change.
+
+### Fixed
+
+- `doctors.search` no longer lets `searchParams` default to an empty map. The
+  server rule is `required|array` and PHP's `required` rejects an empty array, so
+  `{}` was a guaranteed `422` rather than an unfiltered search.
+- Corrected the `measures.health_information` note. The defect it described — the API
+  nulling `identity` before the patient lookup — was fixed API-side on
+  2026-07-21. What actually remains is looser and worth knowing: the lookup is
+  `identity OR phoneNumber` against the global user table and takes the first
+  row, so a phone number alone can resolve a person whose TCKN differs from the
+  one you sent.
+
 ## [1.0.0]
 
 The SDK becomes **partner-only**. Everything that required a patient login is

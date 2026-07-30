@@ -9,7 +9,7 @@
 > Wire contract is derived from the BulutklinikAPI source (Laravel 8.12,
 > OAuth2/Passport) — `app/Packages/Integration/Outher` and `routes/{v3,v4}/outher.php`.
 
-- **Spec version:** 1.0.0 — **breaking.** The SDKs become a single-persona,
+- **Spec version:** 1.0.1 — **breaking** (from 0.6.x). The SDKs become a single-persona,
   partner-only surface. Everything that required a patient login is gone; every
   method now runs on the company-scoped `/outher` channel with a pre-issued
   partner token. See §12 for what was removed and why.
@@ -283,6 +283,10 @@ Two patient-reference shapes recur; both are defined in §8.1.
   `withGivenTreatments`, `withExpertyId`, `withInstitutionId`,
   `withNearestSlotDayRange`). Response: `{ foundDoctorsCount, foundDoctors: [ { doctor_id, name, surname, branch_name, … } ] }`.
   Note `orderParams` here is narrower than the patient surface — `point` is not accepted.
+- **`searchParams` must contain at least one key.** Its rule is `required|array`,
+  and PHP's `required` rejects an empty array — so `{}` is a guaranteed `422`,
+  not an unfiltered search. SDKs must therefore make `searchParams` a required
+  argument and must not default it to an empty map.
 - `detail` `doctor_id` feeds `slots.schedule` and the booking calls.
 
 ### 6.2 `slots`  `[scope:apiouther]`
@@ -403,11 +407,17 @@ each with a `*Date`.
 > contract, needs the `teusan` scope instead of `apiouther`, and takes a flat
 > `identity` + `phoneNumber`. Prefer `addList` for new integrations.
 >
-> **Known API bug (document, don't replicate):** for `healthInformation`,
-> `AddNewUserMeasuresListRequest::prepareForValidation` reads `identity` from
-> `$this->message` instead of `$this->identity`, nulling it during validation; in
-> practice matching falls back to `phoneNumber`. The SDK sends the correct
-> contract and notes this in the README.
+> **Its patient matching is an OR, and it is loose.** The lookup is
+> `WHERE identity = … OR phone_number = …` against the **global** user table,
+> taking the first row (`PatientUsersModel::patientUserFindWithOr`). A phone
+> number alone can therefore resolve a person whose TCKN differs from the one you
+> sent. Send both fields, but do not assume they are checked as a pair. This is
+> the exact opposite of the `apiouther` reads in this group, which scope to your
+> own company and fail closed on ambiguity (§8.1) — another reason to prefer
+> `addList`.
+>
+> (Spec 0.x documented a defect here that nulled `identity` outright before it
+> reached the lookup. That was fixed API-side on 2026-07-21; the OR remains.)
 
 ### 6.5 `laboratory`  `[scope:apiouther]`
 

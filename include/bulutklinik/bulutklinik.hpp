@@ -265,6 +265,10 @@ public:
     explicit DoctorsResource(detail::Transport* transport) : t_(transport) {}
 
     /// `order_params` accepts "name", "order" and "slot".
+    ///
+    /// `search_params` must carry at least one key: the server rule is
+    /// `required|array` and PHP's `required` rejects an empty array, so `{}` is a
+    /// validation error rather than an unfiltered search.
     nlohmann::json search(const nlohmann::json& search_params, int current_page = 1,
                           const std::vector<std::string>& order_params = {});
     nlohmann::json branches();
