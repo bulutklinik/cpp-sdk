@@ -4,6 +4,49 @@ All notable changes to the Bulutklinik C++ SDK are documented here. The format i
 based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0]
+
+Restores the `auth` group. 1.0.x removed it on a mistaken premise: that a partner
+token could only be issued out of band. It cannot be minted by a
+*client-credentials* grant — there is no `oauth/token` route — but it **is** minted
+by the password grant at `connectApi`, using the client id, client secret and
+service identity the Developer Platform issues per application. That is exactly
+what the portal's own quick-start shows.
+
+This release is **additive**. All 28 data methods keep their paths, bodies and
+signatures; a 1.0.x integration that supplies `partner_token` keeps working.
+
+### Added
+
+- **`client.auth()`** with three methods:
+  - `connect` — `POST /general/connectApi`, public. Exchanges the portal
+    credentials for an access + refresh token pair and stores both. Returns a
+    login result; if the account has SMS 2FA enabled it reports
+    `two_factor_required` with the server's challenge instead of throwing.
+  - `refresh` — `POST /general/refreshApi`, public. Rotates both tokens.
+  - `disconnect` — `POST /general/disconnectApi`. Revokes the access token and
+    its refresh tokens, then clears the store. Sent with an empty body on
+    purpose: the endpoint's optional `device` mapping has no default branch
+    server-side.
+- **`client_id` / `client_secret`** client options, used by `connect` and by the
+  silent refresh.
+- **Silent refresh + single retry** on `401` / `resultType 4`, concurrency-safe —
+  simultaneous failures share one in-flight refresh rather than stampeding.
+- **Optional refresh-token persistence** on the token store. Implementing it is
+  not required: a store written against the 1.0.x interface keeps working, and
+  the SDK then holds the refresh token in memory for the client's lifetime (a
+  process restart needs `auth().connect()` rather than a refresh).
+- `RefreshTokenStore`, the optional `TokenStore` extension that carries it;
+  `InMemoryTokenStore` implements it and its constructor now takes an
+  optional refresh token as a second argument.
+- `Client::refresh_token()`, for inspecting the token currently in play.
+
+### Changed
+
+- `resultType 4` no longer terminates immediately. It triggers the refresh path;
+  the error surfaces only when there is no refresh token or the refresh itself
+  fails, and its message now points at `auth().connect()`.
+
 ## [1.0.1]
 
 Documentation and contract corrections found by auditing the SDKs against the

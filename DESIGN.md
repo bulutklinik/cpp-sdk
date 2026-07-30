@@ -9,12 +9,15 @@
 > Wire contract is derived from the BulutklinikAPI source (Laravel 8.12,
 > OAuth2/Passport) — `app/Packages/Integration/Outher` and `routes/{v3,v4}/outher.php`.
 
-- **Spec version:** 1.0.1 — **breaking** (from 0.6.x). The SDKs become a single-persona,
-  partner-only surface. Everything that required a patient login is gone; every
-  method now runs on the company-scoped `/outher` channel with a pre-issued
-  partner token. See §12 for what was removed and why.
+- **Spec version:** 1.1.0 — restores the `auth` group. 1.0.x wrongly claimed the
+  partner token could only be issued out of band; it is in fact obtained through
+  the same `connectApi` password grant every other persona uses, and it is
+  refreshable. See §5 and §12.1.
+  1.0.0/1.0.1 made the SDKs single-persona: everything that required a *patient*
+  login is gone, and every data method runs on the company-scoped `/outher`
+  channel. That part is unchanged.
 - **API:** BulutklinikAPI `v3` (default) or `v4` — selectable per client.
-- **Scope:** 6 services / 28 endpoints (partner persona).
+- **Scope:** 7 services / 31 endpoints (partner persona).
 
 ---
 
@@ -26,6 +29,7 @@ patients of **its own company**.
 
 | Service        | Endpoints | Purpose                                                     |
 |----------------|:---------:|-------------------------------------------------------------|
+| `auth`         | 3         | Obtain, refresh and revoke the partner access token         |
 | `doctors`      | 4         | Doctor discovery: search, branches, detail, city list       |
 | `slots`        | 1         | Doctor availability (materialized slots)                    |
 | `appointments` | 9         | Reserve, confirm, free-form booking, cancel, list, lookup   |
@@ -40,7 +44,7 @@ patients of **its own company**.
 | Who authenticates | your **company**, via a pre-issued partner token |
 | Whose data you see | patients of **your own company only** |
 | How a patient is named | **inline on every call** (`patient` / `user` object) — there is no session |
-| Token lifecycle | issued out of band, ~30 days; **the SDK cannot refresh it** (§5.3) |
+| Token lifecycle | minted by `auth.connect` from your client id/secret + service credentials, ~30 days, refreshable (§5) |
 
 There is no patient login, no session, and no per-user access token. Two calls
 for two different patients are indistinguishable to the transport — the patient
@@ -54,8 +58,8 @@ several read endpoints are `POST` although they are semantically reads.
 
 Not exposed, because the API has no company-scoped equivalent:
 
-- **Patient authentication and registration** — login, 2FA, token refresh, sign-up,
-  social sign-up, password reset, logout.
+- **Patient** authentication and registration — patient sign-up, social sign-up,
+  password reset. (Partner authentication *is* covered — see §5.)
 - **Payments** — discount codes, the saved-card vault, 3-D Secure. Partner booking
   hands payment off to a browser `url` (§6.3); no partner endpoint produces a
   financial record.
@@ -140,11 +144,11 @@ typed error (§4).
 | `1`   | Error    | Raise `ApiError` (or a more specific subtype based on HTTP status / `errorType`). |
 | `2`   | Logout   | Clear the token store, raise `AuthenticationError` (token revoked).          |
 | `3`   | Update   | Raise `ApiError` with an "update required" marker.                           |
-| `4`   | Refresh  | The partner token is expired or invalid. **There is nothing to refresh** (§5.3) — raise `AuthenticationError` telling the caller to install a newly issued token. |
+| `4`   | Refresh  | Access token expired. Triggers the silent refresh + single retry (§5.4). If no refresh token is held, or the refresh itself fails, raise `AuthenticationError`. |
 
 > Implementation note: `/outher` returns `resultType 4` with HTTP `401` on an
 > expired token. A bare HTTP `401` without a parseable envelope MUST be treated
-> identically. Neither triggers a retry.
+> identically — both trigger the refresh path.
 
 ### 3.2 The `501` convention
 
@@ -171,7 +175,7 @@ BulutklinikError                  (base — all SDK errors derive from this)
 ├── TransportError                (network failure, timeout, DNS, TLS — no HTTP response)
 └── ApiError                      (got an HTTP response that wasn't a success)
     ├── ValidationError           (422, or errorType=validation)
-    ├── AuthenticationError       (401 / resultType 2 / resultType 4 — token invalid, expired or revoked)
+    ├── AuthenticationError       (401 after a failed/absent refresh, or resultType 2 — session revoked)
     ├── AuthorizationError        (403 — authenticated but the token lacks the scope, or carries no company)
     ├── NotFoundError             (404)
     └── RateLimitError            (429 — throttled; carries Retry-After if present)
@@ -179,7 +183,7 @@ BulutklinikError                  (base — all SDK errors derive from this)
 
 Each `ApiError` carries: `httpStatus`, `resultType`, `errorType`, `errorMessage`,
 the raw `data`, and the originating request (method + path) for debugging.
-Mapping precedence: logout/expiry (`resultType == 2` or `4`) → string
+Mapping precedence: revoked session (`resultType == 2`) → string
 `errorType == "validation"` → HTTP status (401→Auth, 403→Authz, 404→NotFound,
 422→Validation, 429→RateLimit) → otherwise (incl. numeric `errorType`, or success
 HTTP with `resultType != 0`) → `ApiError`.
@@ -195,68 +199,131 @@ Because `errorType` may be numeric (§3), guard before string-matching it.
 
 ## 5. Authentication
 
-### 5.1 The partner token
+### 5.1 Where the credentials come from
 
-OAuth2 via Laravel Passport, guard `apiusers`, scope `apiouther` (plus `teusan`
-for `measures.healthInformation`). The token is **issued out of band** — through
-the Bulutklinik Developer Platform, not by any SDK call. There is no
-client-credentials grant the SDK can drive, and no `oauth/token` request.
+The Bulutklinik Developer Platform issues, per approved application, three things:
 
-Consequences the SDKs must honour:
+| Value | Used as |
+|-------|---------|
+| **Client ID** | `apiClientId` — the OAuth2 client |
+| **Client Secret** | `apiSecretKey` — the OAuth2 client secret |
+| **Service identity** | `apiUserName` — a project-specific login, *not* the developer's e-mail |
 
-1. The token is a **configuration input**, like an API key.
-2. There is **no login method** on the client.
-3. There is **no auto-refresh** and no retry-after-refresh (contrast: spec 0.x §5.4).
-4. The company the token belongs to is fixed at issue time. It cannot be
-   overridden per request.
+The password is the one set when registering on the portal. Nothing here is a
+ready-made bearer token: the token is **minted by calling the API**.
 
-### 5.2 Token store (pluggable)
+> Spec 1.0.x got this wrong. It described the token as "issued out of band" with
+> "no grant the SDK can drive", and therefore dropped `auth` entirely. The grant
+> below has always existed and is what the portal's own quick-start shows.
 
-The token is read through a `TokenStore` on **every** request, so a long-lived
-process can rotate the credential without being rebuilt — point the store at a
-file, a database, or a secret manager and the next call picks up the new value.
+### 5.2 Obtaining a token — `auth.connect`
 
-Required operations (named per language):
+`POST /general/connectApi`. **Public** (no `Authorization`), rate-limited.
 
-| Operation  | Purpose                                                          |
-|------------|------------------------------------------------------------------|
-| get token  | Return the current partner token, or null/empty if none.         |
-| set token  | Replace the stored token (accepts null to unset).                |
-| clear      | Drop the stored token. Called automatically on `resultType 2`.    |
+| Field | Required | Notes |
+|-------|:--------:|-------|
+| `apiClientId` | ✓ | Client ID from the portal. |
+| `apiSecretKey` | ✓ | Client Secret from the portal. |
+| `apiUserName` | ✓ | The service identity. |
+| `apiUserPassword` | ✓ | The portal account password. |
+| `loginMode` | ✓ | `email` (what the portal documents) \| `identity` \| `phone` \| `user_id`. |
 
-The default implementation is in-memory. The `partnerToken` client option is a
-convenience that seeds one:
+Success → `data: { access_token, refresh_token, password_policy }`. The SDK
+persists both tokens (§5.3) and returns a login result.
+
+Under the hood this is a Passport **password grant**; the granted scope is read
+from the authenticated row's `client_scope`, which is what ties a partner
+application to `apiouther`. A partner integration therefore never sends a scope —
+it is a property of the credentials.
+
+> **No CAPTCHA for partners.** The server only demands a CAPTCHA when the
+> authenticating row is a patient, doctor or developer account. A partner
+> (`user_group = api`) is exempt, which is what makes this callable from a
+> headless SDK at all.
+
+**Two-factor branch.** If the account has SMS 2FA enabled, `data` carries a
+`response` blob and **no** `access_token`. SDKs surface this as a typed
+*two-factor required* result rather than an error, so the caller can collect the
+code and finish the login. Partner service identities do not normally have 2FA
+on, but the branch exists and must not be mistaken for a malformed response.
+
+### 5.3 Token store (pluggable)
+
+Tokens are read through a `TokenStore` on **every** request, so a long-lived
+process can rotate credentials without being rebuilt.
+
+| Operation | Purpose |
+|-----------|---------|
+| get token | The current access token, or null/empty. |
+| set token | Replace it (accepts null to unset). |
+| clear | Drop everything. Called automatically on `resultType 2`. |
+
+A store MAY additionally implement **refresh-token persistence** (`get refresh
+token` / `set refresh token`). This is an *optional extension*, not part of the
+base interface — a store written against spec 1.0.x keeps working unchanged. When
+the injected store does not implement it, the SDK holds the refresh token in
+memory for the client's lifetime; the only consequence is that a process restart
+requires a fresh `connect` instead of a `refresh`. The built-in in-memory store
+implements both.
+
+The `partnerToken` option remains, for callers who already hold a token and do
+not want the SDK to mint one:
 
 ```
-new Client({ partnerToken: "…" })           ⇒ in-memory store seeded with the token
-new Client({ tokenStore: myVaultStore })    ⇒ the token comes from your store
-new Client({ partnerToken: …, tokenStore: … })  ⇒ configuration error, raised at construction
+new Client({ clientId, clientSecret })      ⇒ call auth.connect to obtain tokens
+new Client({ partnerToken: "…" })           ⇒ in-memory store seeded with a token
+new Client({ tokenStore: myVaultStore })    ⇒ tokens come from your store
+new Client({ partnerToken: …, tokenStore: … })  ⇒ configuration error at construction
 ```
 
-Passing both is rejected rather than silently resolved: either the literal or the
-store is the source of truth, and guessing which one the caller meant is how
-credential bugs get shipped.
+Passing both a literal and a store is rejected rather than silently resolved:
+guessing which one the caller meant is how credential bugs get shipped.
 
-If no token is available when a request is dispatched, the SDK raises
-`AuthenticationError` **before** touching the network — an unauthenticated call to
-`/outher` would only come back as a confusing `401`/`resultType 4`.
+If no token is available when a data request is dispatched, the SDK raises
+`AuthenticationError` **before** touching the network.
 
-### 5.3 Expiry
+### 5.4 Refresh — `auth.refresh`, and the silent retry
 
-Passport issues these tokens with a ~30 day lifetime. When one expires the API
-answers `401` + `resultType 4`; the SDK raises `AuthenticationError` and does
-**not** retry. Recovery is operational: obtain a newly issued token and write it
-into the token store (or rebuild the client). SDK READMEs must say this plainly —
-`resultType 4` used to mean "the SDK will fix this silently" and now means the
-opposite.
+`POST /general/refreshApi`. **Public.** Body: `refreshToken`, `clientId`,
+`clientSecretKey`. Success → `data: { access_token, refresh_token }` — both
+rotate, so persist both.
+
+On any partner-authenticated call:
+
+1. Send it with the current access token.
+2. If the response is `401` **or** `resultType == 4`, a refresh token is held, and
+   this request has not already been retried:
+   a. refresh, b. persist the new tokens, c. retry the original request **once**.
+3. If the refresh fails, or `resultType == 2` comes back, clear the store and
+   raise `AuthenticationError`.
+
+The retry is bounded to one attempt. Refresh must be concurrency-safe:
+simultaneous 401s share a single in-flight refresh rather than stampeding.
+
+> A failed refresh answers `resultType 2` with HTTP 400 — which the envelope rules
+> (§3.1) already map to "clear the store and raise". No special case needed.
+
+### 5.5 Revoking — `auth.disconnect`
+
+`POST /general/disconnectApi`. **Partner bearer.** Revokes the access token and
+all of its refresh tokens, then the SDK clears the store.
+
+> Send an **empty body**. The endpoint optionally accepts a device-token cleanup
+> (`token` + `device`), but its `device` mapping has no default branch — an
+> unexpected value raises server-side. There is no partner use for it.
+
+### 5.6 Lifetime
+
+Access tokens last ~30 days, refresh tokens ~130. Refreshing is the normal path;
+a full `connect` is only needed on first use or after both have lapsed.
 
 ---
 
-## 6. Endpoint reference (28)
+## 6. Endpoint reference (31)
 
 Notation: **Canonical name** = language-neutral concept → per-language naming
-follows §7. Every endpoint below requires the partner token; the scope column
-lists the OAuth scope the token must carry.
+follows §7. Every endpoint below requires the partner token except the two public
+`auth` calls (§6.0); the scope column lists the OAuth scope the token must carry.
 
 Two patient-reference shapes recur; both are defined in §8.1.
 
@@ -264,6 +331,20 @@ Two patient-reference shapes recur; both are defined in §8.1.
   **reads**. Never creates anything.
 - **`bookingUser`** — `{ name, surname, phoneNumber, identityNumber?, email?, birthdate?, nationality?, price? }`.
   Used by **writes**. Creates the patient in your company if absent.
+
+### 6.0 `auth`
+
+Token lifecycle. Bodies and semantics in §5.
+
+| Canonical    | Method | Path                        | Auth    |
+|--------------|--------|-----------------------------|---------|
+| `connect`    | POST   | `/general/connectApi`       | public  |
+| `refresh`    | POST   | `/general/refreshApi`       | public  |
+| `disconnect` | POST   | `/general/disconnectApi`    | partner |
+
+`connect` and `refresh` are the only endpoints in this spec that are **not**
+partner-authenticated — they are what produce the credential everything else
+uses.
 
 ### 6.1 `doctors`  `[scope:apiouther]`
 
@@ -457,9 +538,10 @@ group exposes the canonical methods above. **There is no namespace prefix** — 
 partner surface *is* the surface.
 
 ```
-client.doctors.search(...)          client.measures.addList(...)
-client.slots.schedule(...)          client.laboratory.results(...)
-client.appointments.reserve(...)    client.diets.list(...)
+client.auth.connect(...)            client.measures.addList(...)
+client.doctors.search(...)          client.laboratory.results(...)
+client.slots.schedule(...)          client.diets.list(...)
+client.appointments.reserve(...)
 ```
 
 Per-language casing & idioms:
@@ -489,13 +571,14 @@ reserved.
 | `apiVersion`  | `v3`           | `v3` \| `v4`. Combined with `environment` to build the base URL. |
 | `baseUrl`     | —              | Explicit URL; overrides `environment` + `apiVersion`. |
 | `lang`        | `tr`           | Default `lang` header; overridable per request.    |
-| `partnerToken`| —              | The partner token. Seeds the default in-memory store. |
-| `tokenStore`  | in-memory      | Pluggable token source (§5.2). Mutually exclusive with `partnerToken`. |
+| `clientId` / `clientSecret` | — | OAuth client credentials from the portal. Required by `auth.connect` and `auth.refresh`. |
+| `partnerToken`| —              | An already-minted access token. Seeds the default in-memory store. |
+| `tokenStore`  | in-memory      | Pluggable token source (§5.3). Mutually exclusive with `partnerToken`. |
 | `timeout`     | sane default   | Request timeout.                                   |
 | `httpClient`  | platform default | Injectable transport (PSR-18, http.Client, HttpClient, etc.). |
 
-`clientId` / `clientSecret` are **gone** — they existed only for the patient
-password and refresh grants.
+`clientId` / `clientSecret` are back in 1.1.0: the partner token is minted by the
+same password grant, so they are needed for `connect` and `refresh` (§5).
 
 ### 7.2 Escape hatch — arbitrary requests
 
@@ -586,7 +669,8 @@ the SDK.
 2. **Minimal dependencies** — prefer the platform HTTP client; pin the documented
    stack per language (see §7 / PLAN.md).
 3. **Typed** — public API and `data` payloads typed where the language supports it.
-4. **Fail fast on a missing token** — raise before dispatching (§5.2).
+4. **Fail fast on a missing token** — raise before dispatching (§5.3), and
+   auto-refresh + retry once per §5.4, concurrency-safe.
 5. **Pluggable** token store and HTTP client.
 6. **Errors** per §4 with full context.
 7. **Tested** — unit tests for envelope/error/auth/config logic + at least one live
@@ -601,12 +685,15 @@ the SDK.
 ## 10. Live validation reference (test env)
 
 - Base: `https://apitest.bulutklinik.com/api/v3` (or `/v4`).
-- Auth: a partner token issued for a test company with the `apiouther` scope.
-  Unlike the patient surface there is no shared test credential in the Postman
-  collection — the token is per-integration.
-- Smoke path that needs no patient data: `doctors.branches` → `doctors.locations`
-  → `laboratory.catalog`. All three are `GET`, scope-gated only, and prove the
-  token and base URL are right.
+- Auth: an approved portal application for a test company whose credentials carry
+  the `apiouther` scope. Credentials are per-integration; there is no shared test
+  credential in the Postman collection.
+- Smoke path that needs no patient data: `auth.connect` → `doctors.branches` →
+  `doctors.locations` → `laboratory.catalog`. The three reads are `GET` and
+  scope-gated only, so together with the login they prove the credentials, the
+  granted scope and the base URL are all right.
+- `auth.refresh` can be exercised directly rather than waiting ~30 days for a
+  natural expiry.
 - Patient-scoped reads need a patient that exists **in the token's company**;
   a TCKN that works on the patient surface will not necessarily resolve here.
 
@@ -624,13 +711,36 @@ divergence here) — code and SSOT must never silently disagree.
 
 ---
 
-## 12. Migration from 0.6.x
+## 12. Migration
+
+### 12.0 From 1.0.x — the `auth` group is back
+
+1.0.x removed `auth` on the mistaken premise that a partner token could only be
+issued out of band. It cannot be minted by a *client-credentials* grant — there is
+no `oauth/token` route — but it is minted by the **password** grant at
+`connectApi`, using the client id/secret and service identity the portal hands
+out. 1.1.0 restores `auth.connect` / `auth.refresh` / `auth.disconnect` and the
+silent refresh + retry that goes with them.
+
+This is **additive**. All 28 data methods keep their paths, bodies and
+signatures. What changes:
+
+| 1.0.x | 1.1.0 |
+|-------|-------|
+| `partnerToken` was the only way in | still supported; or call `auth.connect` with `clientId`/`clientSecret` |
+| `resultType 4` → terminal `AuthenticationError` | → silent refresh + one retry; error only if that fails |
+| `TokenStore` held one token | unchanged; refresh-token persistence is an **optional** extension a store may add (§5.3) |
+
+A 1.0.x integration that seeds `partnerToken` and never hits an expiry keeps
+working untouched.
+
+### 12.1 From 0.6.x
 
 0.6.x shipped two personas: a patient surface at the client root and a partner
-surface under `client.partner.*`. 1.0.0 keeps **only** the partner one and lifts
+surface under `client.partner.*`. 1.0.0 kept **only** the partner one and lifted
 it to the root.
 
-### 12.1 Mechanical rename
+#### Mechanical rename
 
 | 0.6.x | 1.0.0 |
 |-------|-------|
@@ -643,7 +753,7 @@ it to the root.
 
 Behaviour, paths and payloads of these 28 methods are unchanged.
 
-### 12.2 Removed with no replacement
+#### Removed with no replacement
 
 `auth` (all 11 methods) · `payments` (5) · `skin` · `meals` · `addresses` (4) ·
 and the patient-persona `doctors`/`slots`/`appointments`/`measures`/`laboratory`/`diets`
@@ -651,13 +761,13 @@ that lived at the root in 0.6.x. §1.2 explains why each has no partner
 equivalent. An application that needs a patient session must talk to the API
 directly; the SDK no longer models it.
 
-### 12.3 Configuration
+#### Configuration
 
 | 0.6.x | 1.0.0 |
 |-------|-------|
-| `clientId`, `clientSecret` | removed |
+| `clientId`, `clientSecret` | removed in 1.0.x, **restored in 1.1.0** (§5) |
 | `partnerToken` (optional, for 2 endpoints) | **required** credential for the whole client |
-| token store held `accessToken` + `refreshToken` | holds one partner token |
-| silent refresh + retry on 401/`resultType 4` | removed — `AuthenticationError`, no retry (§5.3) |
+| token store held `accessToken` + `refreshToken` | holds the access token; refresh persistence is an optional store extension (§5.3) |
+| silent refresh + retry on 401/`resultType 4` | removed in 1.0.x, **restored in 1.1.0** (§5.4) |
 | base URL fixed at `/api/v3` | `/api/v3` or `/api/v4` via `apiVersion` |
 | escape hatch `auth` default `bearer` | default `partner`; `bearer` no longer exists |

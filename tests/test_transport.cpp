@@ -189,7 +189,7 @@ TEST_CASE("maps numeric 404 to NotFoundError") {
     REQUIRE_THROWS_AS(client.doctors().branches(), NotFoundError);
 }
 
-TEST_CASE("an expired token is surfaced without retrying") {
+TEST_CASE("an expired token is surfaced without retrying when there is no refresh token") {
     auto backend = std::make_shared<MockBackend>();
     backend->responder = [](const HttpRequest&) {
         return json_resp(401, R"({"resultType":4,"errorMessage":"You must log in."})");

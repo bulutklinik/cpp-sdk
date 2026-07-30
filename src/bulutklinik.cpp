@@ -87,11 +87,11 @@ nlohmann::json parse_envelope(const std::string& text) {
     if (result_type && *result_type == 2) {
         throw AuthenticationError(message, status, result_type, error_type, data, method, path, retry);
     }
-    // resultType 4 used to trigger a silent refresh. On the partner surface there
-    // is nothing to refresh, so say what the caller actually has to do.
+    // resultType 4 reaches here only when the silent refresh could not run or
+    // failed — the transport retries first (DESIGN.md 5.4).
     if (result_type && *result_type == 4) {
-        throw AuthenticationError(message + " The partner token is expired or invalid - install a newly"
-                                            " issued token; the SDK cannot refresh it.",
+        throw AuthenticationError(message + " The access token is expired and could not be refreshed -"
+                                            " call auth().connect() again.",
                                   status, result_type, error_type, data, method, path, retry);
     }
     if (is_validation) {
@@ -120,39 +120,133 @@ enum class AuthMode { Public, Partner };
 /// Builds requests, unwraps the response envelope and maps failures to typed
 /// exceptions.
 ///
-/// There is no silent refresh: a partner token is issued out of band and cannot
-/// be renewed from here, so an expired one (401 / resultType 4) surfaces as an
-/// AuthenticationError instead of being retried.
+/// On a 401 / resultType 4 it refreshes once and retries the original request;
+/// the error surfaces only when there is no refresh token or the refresh itself
+/// fails. Concurrent refreshes are serialised, and a caller that finds the token
+/// already rotated skips straight to the retry.
 class Transport {
 public:
     Transport(std::shared_ptr<HttpBackend> backend, std::string base_url, std::string lang,
-              std::shared_ptr<TokenStore> token_store, long timeout_ms)
+              std::shared_ptr<TokenStore> token_store, std::optional<std::string> client_id,
+              std::optional<std::string> client_secret, long timeout_ms)
         : backend_(std::move(backend)),
           base_url_(std::move(base_url)),
           lang_(std::move(lang)),
           token_store_(std::move(token_store)),
+          client_id_(std::move(client_id)),
+          client_secret_(std::move(client_secret)),
           timeout_ms_(timeout_ms) {}
 
     TokenStore& token_store() { return *token_store_; }
+    const std::optional<std::string>& client_id() const { return client_id_; }
+    const std::optional<std::string>& client_secret() const { return client_secret_; }
+
+    /// Persist a freshly minted token pair.
+    void set_tokens(const std::string& access, const std::optional<std::string>& refresh) {
+        token_store_->set_token(access);
+        if (auto* refreshable = dynamic_cast<RefreshTokenStore*>(token_store_.get())) {
+            refreshable->set_refresh_token(refresh);
+        } else {
+            std::lock_guard<std::mutex> lock(fallback_mutex_);
+            fallback_refresh_token_ = refresh;
+        }
+    }
+
+    std::optional<std::string> refresh_token() const {
+        if (auto* refreshable = dynamic_cast<RefreshTokenStore*>(token_store_.get())) {
+            return refreshable->refresh_token();
+        }
+        std::lock_guard<std::mutex> lock(fallback_mutex_);
+        return fallback_refresh_token_;
+    }
+
+    void clear_tokens() {
+        {
+            std::lock_guard<std::mutex> lock(fallback_mutex_);
+            fallback_refresh_token_.reset();
+        }
+        token_store_->clear();
+    }
+
+    /// Force a refresh using the stored refresh token. Throws on failure.
+    void refresh() {
+        if (!try_refresh(std::nullopt)) {
+            throw AuthenticationError("bulutklinik: token refresh failed", 401, std::nullopt,
+                                      nlohmann::json(nullptr), nlohmann::json(nullptr), "POST",
+                                      "/general/refreshApi", std::nullopt);
+        }
+    }
 
     nlohmann::json send(const std::string& method, const std::string& path, AuthMode auth,
                         const nlohmann::json& body = nlohmann::json(),
-                        const std::optional<std::string>& lang = std::nullopt) {
+                        const std::optional<std::string>& lang = std::nullopt,
+                        bool is_retry = false) {
+        std::optional<std::string> stale_access;
+        if (auth == AuthMode::Partner) {
+            stale_access = token_store_->token();
+        }
+
         Dispatch d = dispatch(method, path, auth, body, lang);
         std::optional<int> result_type = result_type_of(d.envelope);
 
         if (d.status >= 200 && d.status < 300 && result_type && *result_type == 0) {
             return d.envelope.contains("data") ? d.envelope["data"] : nlohmann::json(nullptr);
         }
-        // A revoked token is worth forgetting; an expired one is not, since the
-        // caller may want to inspect it while installing a replacement.
+
+        const bool expired = d.status == 401 || (result_type && *result_type == 4);
+        if (auth == AuthMode::Partner && expired && !is_retry && try_refresh(stale_access)) {
+            return send(method, path, auth, body, lang, true);
+        }
+
+        // A revoked session is worth forgetting; a merely expired access token is
+        // not, since the caller may want to inspect it.
         if (result_type && *result_type == 2) {
-            token_store_->clear();
+            clear_tokens();
         }
         throw_api_error(method, path, d.status, d.envelope, d.retry_after);
     }
 
 private:
+    /// Returns true when a usable access token is in place afterwards.
+    ///
+    /// `stale_access` is the token the failing request actually used: if the store
+    /// no longer holds it, another thread already refreshed and the caller should
+    /// simply retry.
+    bool try_refresh(const std::optional<std::string>& stale_access) {
+        std::lock_guard<std::mutex> lock(refresh_mutex_);
+        if (stale_access && token_store_->token() != stale_access) {
+            return true;
+        }
+
+        std::optional<std::string> refresh = refresh_token();
+        if (!refresh || refresh->empty() || !client_id_ || client_id_->empty() || !client_secret_ ||
+            client_secret_->empty()) {
+            return false;
+        }
+
+        nlohmann::json body = {
+            {"refreshToken", *refresh},
+            {"clientId", *client_id_},
+            {"clientSecretKey", *client_secret_},
+        };
+        Dispatch d = dispatch("POST", "/general/refreshApi", AuthMode::Public, body, std::nullopt);
+        std::optional<int> result_type = result_type_of(d.envelope);
+        nlohmann::json data = d.envelope.contains("data") ? d.envelope["data"] : nlohmann::json(nullptr);
+
+        if (d.status < 200 || d.status >= 300 || !result_type || *result_type != 0 || !data.is_object() ||
+            !data.contains("access_token") || !data["access_token"].is_string()) {
+            clear_tokens();
+            return false;
+        }
+
+        std::optional<std::string> rotated = refresh;
+        if (data.contains("refresh_token") && data["refresh_token"].is_string()) {
+            rotated = data["refresh_token"].get<std::string>();
+        }
+        set_tokens(data["access_token"].get<std::string>(), rotated);
+        return true;
+    }
+
     struct Dispatch {
         int status;
         nlohmann::json envelope;
@@ -166,7 +260,9 @@ private:
             token = token_store_->token();
             if (!token || token->empty()) {
                 // Dispatching anyway would only come back as an opaque 401.
-                throw AuthenticationError("No partner token configured.", 0, std::nullopt,
+                throw AuthenticationError("No access token available. Call auth().connect(), or set"
+                                          " partner_token.",
+                                          0, std::nullopt,
                                           nlohmann::json(nullptr), nlohmann::json(nullptr), method, path,
                                           std::nullopt);
             }
@@ -203,7 +299,13 @@ private:
     std::string base_url_;
     std::string lang_;
     std::shared_ptr<TokenStore> token_store_;
+    std::optional<std::string> client_id_;
+    std::optional<std::string> client_secret_;
     long timeout_ms_;
+    std::mutex refresh_mutex_;
+    /// Used only when the injected store cannot persist the refresh token.
+    mutable std::mutex fallback_mutex_;
+    std::optional<std::string> fallback_refresh_token_;
 };
 
 }  // namespace detail
@@ -228,11 +330,13 @@ Client::Client(ClientOptions options) {
     auto store = options.token_store ? options.token_store
                                      : std::make_shared<InMemoryTokenStore>(options.partner_token);
     auto backend = options.http_backend ? options.http_backend : std::make_shared<CprHttpBackend>();
-    transport_ = std::make_shared<detail::Transport>(backend, base, options.lang, store, options.timeout_ms);
+    transport_ = std::make_shared<detail::Transport>(backend, base, options.lang, store, options.client_id,
+                                                    options.client_secret, options.timeout_ms);
 }
 
 Client::~Client() = default;
 
+AuthResource Client::auth() { return AuthResource(transport_.get()); }
 DoctorsResource Client::doctors() { return DoctorsResource(transport_.get()); }
 SlotsResource Client::slots() { return SlotsResource(transport_.get()); }
 AppointmentsResource Client::appointments() { return AppointmentsResource(transport_.get()); }
@@ -248,6 +352,8 @@ nlohmann::json Client::request(const std::string& method, const std::string& pat
 }
 
 TokenStore& Client::token_store() { return transport_->token_store(); }
+
+std::optional<std::string> Client::refresh_token() const { return transport_->refresh_token(); }
 
 // ---------------- resources ----------------
 
@@ -301,6 +407,55 @@ nlohmann::json AppointmentLookup::to_json() const {
     put_opt(out, "appointmentDate", appointment_date);
     if (is_outher_doctor) out["isOutherDoctor"] = *is_outher_doctor;
     return out;
+}
+
+// ---------------- AuthResource ----------------
+
+LoginResult AuthResource::connect(const ConnectInput& input) {
+    std::optional<std::string> id = input.client_id ? input.client_id : t_->client_id();
+    std::optional<std::string> secret = input.client_secret ? input.client_secret : t_->client_secret();
+    if (!id || id->empty() || !secret || secret->empty()) {
+        throw std::invalid_argument(
+            "bulutklinik: client_id and client_secret are required - pass them to connect() or set them "
+            "on ClientOptions.");
+    }
+
+    nlohmann::json body = {
+        {"apiClientId", *id},
+        {"apiSecretKey", *secret},
+        {"apiUserName", input.api_user_name},
+        {"apiUserPassword", input.api_user_password},
+        {"loginMode", input.login_mode.empty() ? std::string("email") : input.login_mode},
+    };
+    nlohmann::json data = t_->send("POST", "/general/connectApi", detail::AuthMode::Public, body);
+
+    if (data.is_object() && data.contains("access_token") && data["access_token"].is_string()) {
+        std::optional<std::string> refresh;
+        if (data.contains("refresh_token") && data["refresh_token"].is_string()) {
+            refresh = data["refresh_token"].get<std::string>();
+        }
+        t_->set_tokens(data["access_token"].get<std::string>(), refresh);
+
+        LoginResult result;
+        if (data.contains("password_policy")) {
+            result.password_policy = data["password_policy"];
+        }
+        return result;
+    }
+
+    LoginResult result;
+    result.two_factor_required = true;
+    if (data.is_object() && data.contains("response") && data["response"].is_string()) {
+        result.two_factor_response = data["response"].get<std::string>();
+    }
+    return result;
+}
+
+void AuthResource::refresh() { t_->refresh(); }
+
+void AuthResource::disconnect() {
+    t_->send("POST", "/general/disconnectApi", detail::AuthMode::Partner, nlohmann::json::object());
+    t_->clear_tokens();
 }
 
 // ---------------- DoctorsResource ----------------

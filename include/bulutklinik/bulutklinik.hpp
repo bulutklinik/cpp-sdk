@@ -3,7 +3,7 @@
 // Single-persona SDK: every call runs on the company-scoped `/outher` surface
 // with the partner token issued for your integration. You act on the patients of
 // your own company, and the patient is named inline on each request — there is
-// no login and no session.
+// no patient session.
 #ifndef BULUTKLINIK_BULUTKLINIK_HPP
 #define BULUTKLINIK_BULUTKLINIK_HPP
 
@@ -79,7 +79,8 @@ class ValidationError : public ApiError {
 public:
     using ApiError::ApiError;
 };
-/// 401, a revoked token (result_type 2), or an expired one (result_type 4).
+/// 401, a revoked token (result_type 2), or an expired one (result_type 4) that
+/// could not be refreshed.
 class AuthenticationError : public ApiError {
 public:
     using ApiError::ApiError;
@@ -103,10 +104,10 @@ public:
 
 // ---------------- token store ----------------
 
-/// Pluggable source for the partner token.
+/// Pluggable source for the partner access token.
 ///
 /// The token is read on every request, so pointing this at a file, cache,
-/// database or secret manager lets a long-running process pick up a newly issued
+/// database or secret manager lets a long-running process pick up a rotated
 /// token without being rebuilt. An empty optional means "no token"; the transport
 /// then fails before dispatching rather than sending an anonymous request.
 ///
@@ -119,11 +120,25 @@ public:
     virtual void clear() = 0;
 };
 
+/// Optional extension: a store that also persists the refresh token.
+///
+/// Deriving from this is not required — a TokenStore written against spec 1.0.x
+/// keeps working. When the injected store does not implement it, the SDK holds
+/// the refresh token in memory for the client's lifetime; the only consequence is
+/// that a process restart needs `auth().connect()` rather than a refresh.
+class RefreshTokenStore : public TokenStore {
+public:
+    virtual std::optional<std::string> refresh_token() const = 0;
+    virtual void set_refresh_token(const std::optional<std::string>& token) = 0;
+};
+
 /// Default, thread-safe in-memory token store.
-class InMemoryTokenStore : public TokenStore {
+class InMemoryTokenStore : public RefreshTokenStore {
 public:
     InMemoryTokenStore() = default;
-    explicit InMemoryTokenStore(std::optional<std::string> token) : token_(std::move(token)) {}
+    explicit InMemoryTokenStore(std::optional<std::string> token,
+                                std::optional<std::string> refresh_token = std::nullopt)
+        : token_(std::move(token)), refresh_token_(std::move(refresh_token)) {}
 
     std::optional<std::string> token() const override {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -133,14 +148,24 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         token_ = token;
     }
+    std::optional<std::string> refresh_token() const override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return refresh_token_;
+    }
+    void set_refresh_token(const std::optional<std::string>& token) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        refresh_token_ = token;
+    }
     void clear() override {
         std::lock_guard<std::mutex> lock(mutex_);
         token_.reset();
+        refresh_token_.reset();
     }
 
 private:
     mutable std::mutex mutex_;
     std::optional<std::string> token_;
+    std::optional<std::string> refresh_token_;
 };
 
 // ---------------- HTTP backend ----------------
@@ -192,9 +217,15 @@ struct ClientOptions {
     std::optional<std::string> base_url;
     std::string lang = "tr";
     /// The partner token issued for your integration. Seeds the default
-    /// in-memory token store.
+    /// in-memory token store. Leave unset and call `auth().connect()` instead to
+    /// mint one from the portal credentials below.
     std::optional<std::string> partner_token;
     std::shared_ptr<TokenStore> token_store;
+    /// OAuth client id from your portal application. Used by `auth().connect()`
+    /// and by the silent refresh.
+    std::optional<std::string> client_id;
+    /// OAuth client secret from your portal application.
+    std::optional<std::string> client_secret;
     std::shared_ptr<HttpBackend> http_backend;
     long timeout_ms = 30000;
 };
@@ -256,6 +287,71 @@ struct AppointmentLookup {
 };
 
 // ---------------- resources ----------------
+
+/// Outcome of `AuthResource::connect`.
+///
+/// When `two_factor_required` is true no tokens were stored and
+/// `two_factor_response` carries the server's challenge blob.
+struct LoginResult {
+    bool two_factor_required = false;
+    std::optional<std::string> two_factor_response;
+    nlohmann::json password_policy = nlohmann::json(nullptr);
+};
+
+/// Credentials a portal application issues. `client_id` and `client_secret` fall
+/// back to the values the client was built with.
+struct ConnectInput {
+    /// The project-specific service identity, not an e-mail you chose.
+    std::string api_user_name;
+    /// The password set when registering on the portal.
+    std::string api_user_password;
+    std::optional<std::string> client_id;
+    std::optional<std::string> client_secret;
+    /// Defaults to "email".
+    std::string login_mode = "email";
+};
+
+/// The token lifecycle.
+///
+/// The Developer Platform issues a client id, a client secret and a
+/// project-specific service identity per approved application; the password is
+/// the one set when registering on the portal. `connect` exchanges those for an
+/// access + refresh token pair, which every other resource then uses.
+///
+/// Neither `connect` nor `refresh` is partner-authenticated: they are the two
+/// public endpoints that *produce* the credential.
+class AuthResource {
+public:
+    explicit AuthResource(detail::Transport* transport) : t_(transport) {}
+
+    /// Log in and store the resulting tokens.
+    ///
+    /// If the account has SMS 2FA enabled the API returns a challenge instead of
+    /// a token pair; the result reports `two_factor_required` rather than
+    /// throwing.
+    ///
+    /// @throws std::invalid_argument when no client id / secret is available.
+    LoginResult connect(const ConnectInput& input);
+
+    /// Exchange the stored refresh token for a new pair. Both tokens rotate. The
+    /// transport already does this automatically on a 401 / result_type 4, so
+    /// calling it by hand only refreshes ahead of time.
+    ///
+    /// @throws AuthenticationError when there is no refresh token or the refresh
+    /// itself fails.
+    void refresh();
+
+    /// Revoke the access token and all of its refresh tokens, then clear the
+    /// store.
+    ///
+    /// Sent with an empty body on purpose: the endpoint also accepts a
+    /// device-token cleanup whose `device` mapping has no default branch
+    /// server-side.
+    void disconnect();
+
+private:
+    detail::Transport* t_;
+};
 
 /// Doctor discovery. Results are scoped to the doctors enabled for your
 /// integration, so a doctor returned here is one you can book. `locations` is the
@@ -442,6 +538,7 @@ public:
     Client(const Client&) = delete;
     Client& operator=(const Client&) = delete;
 
+    AuthResource auth();
     DoctorsResource doctors();
     SlotsResource slots();
     AppointmentsResource appointments();
@@ -468,6 +565,10 @@ public:
     /// The active token store. Write a newly issued partner token here to rotate
     /// the credential without rebuilding the client.
     TokenStore& token_store();
+
+    /// The refresh token currently in play — from the store when it implements
+    /// RefreshTokenStore, otherwise from the transport's in-memory fallback.
+    std::optional<std::string> refresh_token() const;
 
 private:
     std::shared_ptr<detail::Transport> transport_;

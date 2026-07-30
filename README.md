@@ -6,13 +6,13 @@ Official Bulutklinik **partner** API SDK for C++ (C++17). Built on
 This is a single-persona SDK: every call runs on the company-scoped `/outher`
 surface with the partner token issued for your integration. You act on the
 patients of **your own company**, and the patient is named inline on each
-request — there is no login and no session. See [`DESIGN.md`](./DESIGN.md) for
-the full wire contract.
+request — there is no patient session. See [`DESIGN.md`](./DESIGN.md) for the
+full wire contract.
 
-> **1.0.0 is a breaking release.** The patient persona (login, registration,
-> payments, AI analysis, address book) has been removed and the former
-> `client.partner()` namespace was lifted to the client root. See
-> [CHANGELOG.md](./CHANGELOG.md) and DESIGN.md §12 for the migration.
+> **1.1.0 restores `client.auth()`.** 1.0.x wrongly assumed the partner token
+> could only be issued out of band; it is in fact minted by `connectApi` from
+> your portal credentials, and it is refreshable. Existing 1.0.x code that sets
+> `partner_token` keeps working. See [CHANGELOG.md](./CHANGELOG.md).
 
 ## Install (CMake + vcpkg)
 
@@ -38,15 +38,26 @@ target_link_libraries(your_app PRIVATE bulutklinik::sdk)
 #include <bulutklinik/bulutklinik.hpp>
 #include <cstdlib>
 #include <iostream>
+#include <string>
+
+std::string env(const char* key) {
+    const char* value = std::getenv(key);
+    return value ? value : "";
+}
 
 int main() {
     bulutklinik::ClientOptions options;
     options.environment = bulutklinik::Environment::Production;  // Production | Test | Local
     options.api_version = bulutklinik::ApiVersion::V3;           // V3 (default) | V4
-    if (const char* token = std::getenv("BK_PARTNER_TOKEN")) {
-        options.partner_token = token;
-    }
+    options.client_id = env("BK_CLIENT_ID");
+    options.client_secret = env("BK_CLIENT_SECRET");
     bulutklinik::Client client(options);
+
+    // 0) Log in. Tokens are stored and refreshed for you.
+    bulutklinik::ConnectInput login;
+    login.api_user_name = env("BK_SERVICE_IDENTITY");
+    login.api_user_password = env("BK_PASSWORD");
+    client.auth().connect(login);
 
     // 1) Find a doctor you can book — returns an nlohmann::json ("data" payload)
     auto result = client.doctors().search(
@@ -71,10 +82,11 @@ int main() {
 
 ## Services
 
-28 endpoints across six groups.
+31 endpoints across seven groups.
 
 | Group                    | Methods |
 |--------------------------|---------|
+| `client.auth()`          | `connect`, `refresh`, `disconnect` |
 | `client.doctors()`       | `search`, `branches`, `detail`, `locations` |
 | `client.slots()`         | `schedule` |
 | `client.appointments()`  | `reserve`, `reserve_without_agreement`, `instant_reserve`, `create`, `create_without_slot`, `cancel_without_slot`, `list`, `info`, `check_doctor` |
@@ -131,42 +143,75 @@ only it.
 
 ## Authentication
 
-The partner token is **issued out of band** through the Bulutklinik Developer
-Platform. It behaves like an API key: there is no login method, and the SDK
-cannot renew it.
-
-The token is read from a `TokenStore` on **every** request, so a long-running
-process can pick up a newly issued one without being rebuilt:
+Your portal application issues a **client ID**, a **client secret** and a
+project-specific **service identity**; the password is the one you set when
+registering on the portal. `auth().connect()` exchanges them for an access token
+and a refresh token:
 
 ```cpp
-class VaultTokenStore : public bulutklinik::TokenStore {
+bulutklinik::ClientOptions options;
+options.client_id = client_id;
+options.client_secret = client_secret;
+bulutklinik::Client client(options);
+
+bulutklinik::ConnectInput input;
+input.api_user_name = "svc@your-app.bulutklinik";
+input.api_user_password = "your-portal-password";
+// input.login_mode defaults to "email".
+
+bulutklinik::LoginResult result = client.auth().connect(input);
+```
+
+The granted scope comes from the credentials, not the request — a partner
+application is provisioned with `apiouther`, which is what makes `/outher`
+reachable. Already holding a token? Set `partner_token` and skip the login.
+
+If the account has SMS 2FA enabled the API answers with a challenge instead of a
+token pair; `result.two_factor_required` is then true and no token was stored.
+
+### Refresh
+
+Access tokens last ~30 days, refresh tokens ~130. You do not normally call
+`refresh()` yourself: on a `401` / `resultType 4` the SDK refreshes once and
+retries the original request, and concurrent calls share one in-flight refresh.
+
+```cpp
+client.auth().refresh();     // only useful to refresh ahead of time
+client.auth().disconnect();  // revokes both tokens and clears the store
+```
+
+If the refresh fails — or there is no refresh token because you supplied a bare
+`partner_token` — the call throws `AuthenticationError` and you should
+`connect()` again.
+
+### Token storage
+
+Tokens are read from a `TokenStore` on **every** request, so a long-running
+process can rotate them without being rebuilt. Derive from `RefreshTokenStore` to
+persist both:
+
+```cpp
+class VaultTokenStore : public bulutklinik::RefreshTokenStore {
 public:
     std::optional<std::string> token() const override { /* … */ }
     void set_token(const std::optional<std::string>& t) override { /* … */ }
+    std::optional<std::string> refresh_token() const override { /* … */ }
+    void set_refresh_token(const std::optional<std::string>& t) override { /* … */ }
     void clear() override { /* … */ }
 };
 
 options.token_store = std::make_shared<VaultTokenStore>();
-
-// …or rotate the default in-memory store in place:
-client.token_store().set_token(newly_issued_token);
 ```
+
+The two refresh members are **optional**. A plain `TokenStore` — the 1.0.x shape,
+access token only — still works; the SDK then keeps the refresh token in memory,
+so a process restart needs `connect()` rather than a refresh.
 
 Set `partner_token` **or** `token_store`, not both — the constructor throws
 `std::invalid_argument` rather than guessing which one you meant.
 
-### When the token expires
-
-Tokens last about 30 days. An expired one comes back as `401` / `resultType 4`;
-the SDK throws `AuthenticationError` and does **not** retry — there is nothing to
-refresh. Recovery is operational: obtain a newly issued token and write it into
-the store.
-
-> This is the one behaviour that changed meaning in 1.0.0. On the patient SDK
-> `resultType 4` meant "the SDK will fix this silently". Here it means the opposite.
-
 An `AuthorizationError` (403) means the credential itself is wrong — either the
-token lacks the `apiouther` scope, or it resolves to a user with no company. The
+granted scope does not include `apiouther`, or the account has no company. The
 company boundary comes from the token, never from request input, so retrying with
 different body parameters will not help.
 
