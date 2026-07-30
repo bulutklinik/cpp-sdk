@@ -1,8 +1,8 @@
 # Bulutklinik SDK — Canonical Design (SSOT)
 
 > **This file is the single source of truth (SSOT) for every official Bulutklinik
-> SDK.** All language packages (JavaScript/TypeScript, PHP, Python, Go, Java, C#,
-> C++) are hand-written but MUST implement exactly the contract described here.
+> SDK.** All language packages (JavaScript/TypeScript, PHP, Python, Go, C#, C++)
+> are hand-written but MUST implement exactly the contract described here.
 > The canonical copy lives at `dev-kits/DESIGN.md`; an identical copy is vendored
 > into each language repository and re-synced whenever this file changes.
 >
@@ -168,7 +168,7 @@ turn the endpoint into a TCKN-probing oracle.
 All SDKs expose one error hierarchy with a common base. Names follow each
 language's convention (e.g. `BulutklinikError` / `ApiError` in TS, exceptions in
 PHP/Python, `error` values implementing an interface in Go, exception classes in
-Java/C#/C++).
+C#/C++).
 
 ```
 BulutklinikError                  (base — all SDK errors derive from this)
@@ -552,7 +552,6 @@ Per-language casing & idioms:
 | PHP      | `camelCase` | `$client->doctors->search()`. Namespace `Bulutklinik\Sdk`. |
 | Python   | `snake_case`| `client.doctors.search()`. Sync **and** async (`AsyncClient`). |
 | Go       | `PascalCase`| `client.Doctors.Search(ctx, …)`. Context-first, `(T, error)` returns. |
-| Java     | `camelCase` | `client.doctors().search(…)`. Builder for config. |
 | C#       | `PascalCase`+`Async` | `client.Doctors.SearchAsync(…)`. `Task<T>`, `CancellationToken`. |
 | C++      | `snake_case`| `client.doctors().search(…)`. Namespace `bulutklinik`. cpr + nlohmann/json. |
 
@@ -600,7 +599,7 @@ client.request(method, path, { auth, body, lang }) -> data
 | `path`   | Relative to the configured base URL, e.g. `/outher/branches`. Leading slash included. |
 | `auth`   | `partner` (**default**) \| `public`. Accepted as a string or an existing public enum/const per language. |
 | `body`   | Optional JSON payload (object/map/dict). Omitted on `GET`. |
-| `lang`   | Optional per-request `lang` override, where the SDK's transport supports one (JS, PHP, Go, C++). Python / Java / C# apply the client-level `lang`. |
+| `lang`   | Optional per-request `lang` override, where the SDK's transport supports one (JS, PHP, Go, C++). Python and C# apply the client-level `lang`. |
 
 Returns the unwrapped `data` payload as the language's raw JSON value, and raises
 the same typed errors on failure. Representative per-language signatures:
@@ -611,7 +610,6 @@ the same typed errors on failure. Representative per-language signatures:
 | Python   | `client.request(method, path, *, auth="partner", body=None)` — plus the async client |
 | PHP      | `$client->request(string $method, string $path, string $auth = 'partner', ?array $body = null, ?string $lang = null): mixed` |
 | Go       | `client.Do(ctx, method, path, *bk.RequestOptions) (json.RawMessage, error)` (nil options ⇒ partner) |
-| Java     | `client.request(String method, String path, String auth, Object body)` → `JsonNode` |
 | C#       | `client.RequestAsync(HttpMethod method, string path, string auth = "partner", object? body = null, CancellationToken = default)` → `JsonElement` |
 | C++      | `client.request(method, path, bulutklinik::RequestOptions{})` → `nlohmann::json` |
 
