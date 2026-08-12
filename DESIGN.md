@@ -9,7 +9,11 @@
 > Wire contract is derived from the BulutklinikAPI source (Laravel 8.12,
 > OAuth2/Passport) — `app/Packages/Integration/Outher` and `routes/{v3,v4}/outher.php`.
 
-- **Spec version:** 1.1.0 — restores the `auth` group. 1.0.x wrongly claimed the
+- **Spec version:** 1.2.0 — `apiUserPassword` is now a per-application password
+  issued by the portal, not the developer's portal account password. Wire format
+  and every method signature are unchanged; only where the value comes from.
+  See §5.1 and §12.2.
+  1.1.0 restored the `auth` group. 1.0.x wrongly claimed the
   partner token could only be issued out of band; it is in fact obtained through
   the same `connectApi` password grant every other persona uses, and it is
   refreshable. See §5 and §12.1.
@@ -201,16 +205,20 @@ Because `errorType` may be numeric (§3), guard before string-matching it.
 
 ### 5.1 Where the credentials come from
 
-The Bulutklinik Developer Platform issues, per approved application, three things:
+The Bulutklinik Developer Platform issues, per approved application, four things:
 
 | Value | Used as |
 |-------|---------|
 | **Client ID** | `apiClientId` — the OAuth2 client |
 | **Client Secret** | `apiSecretKey` — the OAuth2 client secret |
 | **Service identity** | `apiUserName` — a project-specific login, *not* the developer's e-mail |
+| **Application password** | `apiUserPassword` — a per-application secret, *not* the developer's portal password |
 
-The password is the one set when registering on the portal. Nothing here is a
-ready-made bearer token: the token is **minted by calling the API**.
+All four are shown on the application's page in the portal. The password is
+masked but copyable, and can be regenerated there if it leaks — regenerating it
+leaves the client id and secret untouched, so a leaked password can be rotated
+without re-keying the integration. Nothing here is a ready-made bearer token:
+the token is **minted by calling the API**.
 
 > Spec 1.0.x got this wrong. It described the token as "issued out of band" with
 > "no grant the SDK can drive", and therefore dropped `auth` entirely. The grant
@@ -225,7 +233,7 @@ ready-made bearer token: the token is **minted by calling the API**.
 | `apiClientId` | ✓ | Client ID from the portal. |
 | `apiSecretKey` | ✓ | Client Secret from the portal. |
 | `apiUserName` | ✓ | The service identity. |
-| `apiUserPassword` | ✓ | The portal account password. |
+| `apiUserPassword` | ✓ | The application password from the portal. |
 | `loginMode` | ✓ | `email` (what the portal documents) \| `identity` \| `phone` \| `user_id`. |
 
 Success → `data: { access_token, refresh_token, password_policy }`. The SDK
@@ -710,6 +718,33 @@ divergence here) — code and SSOT must never silently disagree.
 ---
 
 ## 12. Migration
+
+### 12.2 From 1.1.x — `apiUserPassword` is per-application
+
+Nothing in the SDK surface changes: same field, same endpoint, same flow. What
+changes is which secret you put in it.
+
+Until now the value was the developer's **portal account password** — the same
+one used to sign in to the developer platform, shared by every application that
+developer owned. It is now a **per-application password**, generated server-side
+when the application is approved and shown on the application's page in the
+portal.
+
+| | 1.1.x | 1.2.0 |
+|---|-------|-------|
+| Value | developer's portal password | per-application secret |
+| Shape | whatever the developer chose | 32 chars, `[A-Za-z0-9]` |
+| Scope of a leak | the portal account + every application | one application |
+| Rotation | change the portal password (breaks every application) | regenerate in the portal (one application) |
+| Changing the portal password | broke every integration | no effect |
+
+**Action:** read the application password from your application's page in the
+portal and put it where your integration currently keeps the portal password.
+Portal passwords stop authenticating against `connectApi` at the cutover.
+
+> A 32-character password no longer trips the server's password-strength
+> advisory: `password_policy.must_change` is always `false` for partner
+> accounts. Do not treat that field as actionable on a partner login.
 
 ### 12.0 From 1.0.x — the `auth` group is back
 
