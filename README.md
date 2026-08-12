@@ -143,9 +143,10 @@ only it.
 
 ## Authentication
 
-Your portal application issues a **client ID**, a **client secret** and a
-project-specific **service identity**; the password is the one you set when
-registering on the portal. `auth().connect()` exchanges them for an access token
+Your portal application issues four values: a **client ID**, a **client secret**,
+a project-specific **service identity** and an **application password**. The
+password belongs to this application only — it is not your portal account
+password, and you can regenerate it in the portal if it leaks. `auth().connect()` exchanges them for an access token
 and a refresh token:
 
 ```cpp
