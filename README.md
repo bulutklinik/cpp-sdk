@@ -71,7 +71,7 @@ int main() {
     bulutklinik::Patient user;
     user.name = "Ada";
     user.surname = "Lovelace";
-    user.phone_number = "+905551112233";
+    user.phone_number = "+90 5551112233";
     auto held = client.appointments().reserve_without_agreement(slot_id, doctor_id, user);
 
     // 4) Confirm before held["reservationExpired"] passes
